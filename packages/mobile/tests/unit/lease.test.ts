@@ -8,6 +8,7 @@
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { AppError, type LeaseScopedOptions } from 'agent-device';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeviceReleaseContext, DeviceRequest } from '../../src/index.ts';
 import { agentDeviceLeases, type AgentDeviceLeaseRequest } from '../../src/lease/index.ts';
@@ -15,12 +16,13 @@ import type { DriverRequest } from '../../src/lease/driver.ts';
 
 const mocks = vi.hoisted(() => ({
   start: vi.fn(),
-  stop: vi.fn(async (_stateDir: string, _env: NodeJS.ProcessEnv, _leaseId: string | undefined, _label: string, _signal: AbortSignal) => {}),
+  releaseLease: vi.fn(async (_stateDir: string, _scope: LeaseScopedOptions, _signal: AbortSignal) => true),
+  stop: vi.fn(async (_stateDir: string, _env: NodeJS.ProcessEnv, _leaseId: string | undefined, _label: string, _signal: AbortSignal, _options?: { sessionEnded?: boolean }) => {}),
   heartbeat: vi.fn(),
   stopHeartbeat: vi.fn(async () => {}),
   rm: vi.fn(),
 }));
-vi.mock('../../src/lease/daemon.ts', async (original) => ({ ...(await original<typeof import('../../src/lease/daemon.ts')>()), startDriver: mocks.start, stopDriver: mocks.stop }));
+vi.mock('../../src/lease/daemon.ts', async (original) => ({ ...(await original<typeof import('../../src/lease/daemon.ts')>()), startDriver: mocks.start, releaseLease: mocks.releaseLease, stopDriver: mocks.stop }));
 vi.mock('../../src/lease/heartbeat.ts', () => ({ LEASE_TTL_MS: 60_000, startHeartbeat: mocks.heartbeat }));
 vi.mock('node:fs/promises', async (original) => {
   const fs = await original<typeof import('node:fs/promises')>();
@@ -39,6 +41,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   let leases = 0;
   mocks.start.mockImplementation(async ({ allocate }: DriverRequest) => ({ leaseId: `lease-${++leases}`, tenantId: allocate.tenant, runId: allocate.runId, retainOnClose: true }));
+  mocks.releaseLease.mockResolvedValue(true);
   mocks.stop.mockImplementation(async () => {});
   mocks.heartbeat.mockResolvedValue(mocks.stopHeartbeat);
 });
@@ -124,8 +127,25 @@ describe('agentDeviceLeases()', () => {
 
   it('releases a granted lease when the run\'s log throws, instead of losing it', async () => {
     await expect(leases().acquire(request({ log: () => { throw new Error('log closed'); } }), allocation)).rejects.toThrow('log closed');
-    expect(mocks.stop).toHaveBeenCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', expect.any(AbortSignal));
+    expect(mocks.releaseLease).toHaveBeenCalledWith(driver().stateDir, { tenant: 'cloud', runId: 'run-1', leaseId: 'lease-1', leaseBackend: 'android-instance', leaseProvider: 'cloud' }, expect.any(AbortSignal));
+    expect(mocks.stop).toHaveBeenCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', expect.any(AbortSignal), { sessionEnded: true });
     expect(mocks.stopHeartbeat).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives stopDriver a fresh non-aborted signal during acquire cleanup even if releaseLease aborted its own timeout signal', async () => {
+    const timeoutSpy = vi.spyOn(AbortSignal, 'timeout').mockImplementationOnce(() => AbortSignal.abort(new DOMException('release timed out', 'TimeoutError')));
+    try {
+      mocks.releaseLease.mockImplementationOnce(async (_stateDir, _scope, signal) => {
+        signal.throwIfAborted();
+        return true;
+      });
+      await expect(leases().acquire(request({ log: () => { throw new Error('log closed'); } }), allocation)).rejects.toThrow('log closed');
+      const stopSignal = mocks.stop.mock.calls[0]?.[4];
+      expect(stopSignal).toBeInstanceOf(AbortSignal);
+      expect(stopSignal?.aborted).toBe(false);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it("gives each lease's daemon its own state, agent-device home, and the service's env, and never mutates process.env", async () => {
@@ -172,7 +192,8 @@ describe('agentDeviceLeases()', () => {
       return { leaseId: 'lease-1', tenantId: 'cloud', runId: 'run-1', retainOnClose: true };
     });
     await expect(leases().acquire(request({ signal: controller.signal }), allocation)).rejects.toThrow('cancelled');
-    expect(mocks.stop).toHaveBeenCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', expect.any(AbortSignal));
+    expect(mocks.releaseLease).toHaveBeenCalledWith(driver().stateDir, { tenant: 'cloud', runId: 'run-1', leaseId: 'lease-1', leaseBackend: 'android-instance', leaseProvider: 'cloud' }, expect.any(AbortSignal));
+    expect(mocks.stop).toHaveBeenCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', expect.any(AbortSignal), { sessionEnded: true });
     expect(mocks.heartbeat).not.toHaveBeenCalled();
     expect(existsSync(driver().stateDir.replace(/state$/, ''))).toBe(false);
   });
@@ -204,18 +225,23 @@ describe('agentDeviceLeases()', () => {
     await Promise.all([provider.release(lease, context), provider.release(lease, context)]);
     await provider.release(lease, context);
     expect(mocks.stopHeartbeat).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
+    expect(mocks.releaseLease).toHaveBeenCalledWith(driver().stateDir, { tenant: 'cloud', runId: 'run-1', leaseId: 'lease-1', leaseBackend: 'android-instance', leaseProvider: 'cloud' }, context.signal);
+    expect(mocks.releaseLease.mock.invocationCallOrder[0]).toBeLessThan(mocks.stop.mock.invocationCallOrder[0]!);
     expect(mocks.stop).toHaveBeenCalledTimes(1);
-    expect(mocks.stop).toHaveBeenCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', context.signal);
+    expect(mocks.stop).toHaveBeenCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', context.signal, { sessionEnded: true });
     expect(existsSync(driver().stateDir.replace(/state$/, ''))).toBe(false);
   });
 
-  it('tries a release again after one failed', async () => {
+  it('tries a release again after one failed, without repeating an already confirmed RPC lease release', async () => {
     const provider = leases();
     const lease = await provider.acquire(request(), allocation);
     mocks.stop.mockRejectedValueOnce(new Error('daemon busy'));
     await expect(provider.release(lease, context)).rejects.toThrow('daemon busy');
     await provider.release(lease, context);
+    expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
     expect(mocks.stop).toHaveBeenCalledTimes(2);
+    expect(mocks.stop).toHaveBeenLastCalledWith(driver().stateDir, driverEnv(), 'lease-1', 'Cloud', context.signal, { sessionEnded: true });
   });
 
   it('keeps failing to release a lease whose session end is unknown once its daemon is gone', async () => {
@@ -223,6 +249,7 @@ describe('agentDeviceLeases()', () => {
     const stopReport = (data: unknown) => JSON.stringify({ success: true, data });
     const forced = stopReport({ stopped: true, mode: 'forced', providerReleases: { status: 'unknown', released: [], pending: null }, warnings: [] });
     const notRunning = stopReport({ stopped: false, mode: 'not-running', providerReleases: { status: 'completed', released: [], pending: [] }, warnings: [] });
+    mocks.releaseLease.mockResolvedValue(false);
     mocks.stop.mockImplementation(async (_stateDir, _env, leaseId, label) => assertSessionsEnded(mocks.stop.mock.calls.length === 1 ? forced : notRunning, leaseId, label));
     const provider = leases();
     const lease = await provider.acquire(request(), allocation);
@@ -233,6 +260,28 @@ describe('agentDeviceLeases()', () => {
     await expect(provider.release(lease, context)).rejects.toThrow('agent-device found no daemon running for lease lease-1');
     expect(mocks.stop).toHaveBeenCalledTimes(3);
     expect(existsSync(dir)).toBe(true);
+  });
+
+  it('falls back to daemon stop confirmation when RPC lease release returns false or fails, and combines both errors when both fail', async () => {
+    const provider = leases();
+    const first = await provider.acquire(request(), allocation);
+    mocks.releaseLease.mockResolvedValueOnce(false);
+    await provider.release(first, context);
+    expect(mocks.stop).toHaveBeenLastCalledWith(driver(0).stateDir, driverEnv(0), 'lease-1', 'Cloud', context.signal);
+
+    const second = await provider.acquire(request({ slot: 1 }), allocation);
+    mocks.releaseLease.mockRejectedValueOnce(new Error('DELETE /session returned 500'));
+    await provider.release(second, context);
+    expect(mocks.stop).toHaveBeenLastCalledWith(driver(1).stateDir, driverEnv(1), 'lease-2', 'Cloud', context.signal);
+
+    const third = await provider.acquire(request({ slot: 2 }), allocation);
+    mocks.releaseLease.mockRejectedValueOnce(new Error('DELETE /session returned 500'));
+    mocks.stop.mockRejectedValueOnce(new Error('graceful shutdown report unavailable'));
+    await expect(provider.release(third, context)).rejects.toThrow('Cloud lease release failed: DELETE /session returned 500; graceful shutdown report unavailable');
+
+    mocks.releaseLease.mockRejectedValueOnce(new AppError('COMMAND_FAILED', 'No daemon is running.', { reason: 'daemon-not-running' }));
+    mocks.stop.mockRejectedValueOnce(new Error('agent-device found no daemon running for lease lease-3'));
+    await expect(provider.release(third, context)).rejects.toThrow('agent-device found no daemon running for lease lease-3');
   });
 
   it('cleans up without stopping again when the stop confirmed the session ended but the cleanup failed', async () => {
