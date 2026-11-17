@@ -334,12 +334,12 @@ suites that consume the built packages the way a user would.
   `unslop`, tracked by `skills-lock.json`) stay where they are: the CLI
   skips them as installed project skills.
 - `plugins/e2e/` — one package of skills and the e2e MCP server
-  (`.mcp.json`, `npx -y e2e@<version> mcp`) for Codex, Claude Code, and Cursor; Grok
+  (`.mcp.json`, `npx -y e2e@<version> mcp`) for Codex, Claude Code, Cursor, and Devin; Grok
   Build reads the Claude files. The root
   `.agents/plugins/marketplace.json`, `.claude-plugin/marketplace.json`, and
   `.cursor-plugin/marketplace.json` all point here. Edit skill Markdown in
   `skills/`, then run `pnpm plugins:sync`; `pnpm plugins:check` checks the
-  generated copies, license, the Claude and Cursor manifests (generated from
+  generated copies, license, the Claude, Cursor, and Devin manifests (generated from
   Codex's), every manifest's `version`, and the version `.mcp.json` pins, which is the
   runner's (`version-packages` syncs it, so plugin
   installs update once per release; it does the same for
@@ -357,6 +357,11 @@ suites that consume the built packages the way a user would.
   out `metadata.openclaw`, since that spec takes string metadata values only
   (ClawHub publishes from `skills/`), and a skill links no file outside its
   own directory.
+  Devin reads the generated `.devin-plugin/plugin.json` (card fields and the
+  server inline); its loader also reads the root `plugin.json` and MCP files,
+  which declare the same `e2e` server. Its marketplace (CognitionAI/devin-marketplace) lists `plugins/e2e`
+  pinned to one commit of this repository, so a plugin change reaches Devin
+  users only after a pull request there bumps that `sha`.
 
 ## Commands
 
