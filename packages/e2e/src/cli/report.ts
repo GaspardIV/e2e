@@ -2,7 +2,7 @@
  * `e2e report`: opens the self-contained HTML report written by `@e2e-dev/html-reporter`.
  */
 
-import { stat } from 'node:fs/promises';
+import { access, constants, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveProjectConfig } from '@e2e-dev/core/lib/config/resolve';
@@ -92,7 +92,9 @@ async function findReportFile(target: string): Promise<string | undefined> {
   if (targetStats === undefined) return undefined;
   const candidate = targetStats.isDirectory() ? path.join(target, REPORT_FILE) : target;
   const fileStats = candidate === target ? targetStats : await statOrUndefined(candidate);
-  return fileStats?.isFile() === true ? candidate : undefined;
+  if (fileStats?.isFile() !== true) return undefined;
+  await access(candidate, constants.R_OK);
+  return candidate;
 }
 
 async function statOrUndefined(target: string) {

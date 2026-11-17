@@ -6,6 +6,16 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { stripVTControlCharacters } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const accessOverride = vi.hoisted(() => ({ fn: undefined as ((target: string) => Promise<void>) | undefined }));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    access: (target: string, mode?: number) => (accessOverride.fn ? accessOverride.fn(target) : actual.access(target, mode)),
+  };
+});
+
 import { report } from '../../src/cli/report.ts';
 import { platformOpenCommand, spawnBrowserCommand } from '../../src/internal/open-browser.ts';
 import { browserCommand } from '../../src/oauth/browser.ts';
@@ -25,6 +35,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  accessOverride.fn = undefined;
   stdoutSpy.mockRestore();
   stderrSpy.mockRestore();
   rmSync(root, { recursive: true, force: true });
@@ -91,6 +102,22 @@ describe('e2e report', () => {
 
     expect(await report({ cwd: root, path: 'a.html', output: 'out', open: (url) => opened.push(url) })).toBe(2);
     expect(written(stderrSpy)).toContain('pass either [path] or --output, not both');
+    expect(opened).toEqual([]);
+  });
+
+  it('exits 2 when report.html exists but is not readable', async () => {
+    const file = path.join(root, '.e2e', 'report.html');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, '<html></html>', 'utf8');
+    accessOverride.fn = async () => {
+      const error = new Error(`EACCES: permission denied, access '${file}'`) as NodeJS.ErrnoException;
+      error.code = 'EACCES';
+      throw error;
+    };
+    const opened: string[] = [];
+
+    expect(await report({ cwd: root, open: (url) => opened.push(url) })).toBe(2);
+    expect(written(stderrSpy)).toContain('EACCES');
     expect(opened).toEqual([]);
   });
 
