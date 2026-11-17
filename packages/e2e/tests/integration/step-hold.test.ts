@@ -1,5 +1,5 @@
 /**
- * `RunOptions.beforeStep`, the seam behind `e2e run --step`, through real
+ * `RunOptions.hold`, the seam behind `e2e run --step`, through real
  * worker processes: which steps wait, that held time is charged to nothing,
  * and how a hold ends when its step can no longer run.
  */
@@ -74,7 +74,7 @@ test('holds beforeEach and body steps, never teardown', { session: 'seeded' }, a
 });
 `;
 
-describe('beforeStep on the worker path', () => {
+describe('holding steps on the worker path', () => {
   let outcome: RunOutcome;
   let project: FixtureProject;
   const { held, beforeStep } = holder(HOLD_MS);
@@ -82,7 +82,10 @@ describe('beforeStep on the worker path', () => {
   beforeAll(async () => {
     ({ outcome, project } = await runProjectWithConfigFile(
       { 'tests/held.e2e.ts': HELD_SUITE, 'tests/hooks.e2e.ts': HOOKS_SUITE },
-      { configSource: workerFakeConfigSource(1, `\n  timeout: ${TIMEOUT_MS},\n  retries: 1,`), runOptions: { beforeStep } },
+      {
+        configSource: workerFakeConfigSource(1, `\n  timeout: ${TIMEOUT_MS},\n  retries: 1,`),
+        runOptions: { hold: beforeStep, holdSteps: true },
+      },
     ));
   }, 120_000);
 
@@ -143,12 +146,12 @@ describe('beforeStep on the worker path', () => {
   });
 });
 
-describe('beforeStep and the run limits', () => {
+describe('holding steps and the run limits', () => {
   it('stops the time limit while a step is held', async () => {
     const { beforeStep } = holder(3_000);
     const { outcome, project } = await runProjectWithConfigFile(
       { 'tests/limit.e2e.ts': `import { test } from 'e2e';\ntest('outlasts the limit only at holds', async ({ app }) => { await app.open('/slow-1'); await app.open('/slow-2'); });\n` },
-      { configSource: workerFakeConfigSource(1), runOptions: { beforeStep, maxDuration: 4_000 } },
+      { configSource: workerFakeConfigSource(1), runOptions: { hold: beforeStep, holdSteps: true, maxDuration: 4_000 } },
     );
     project.cleanup();
     expect(outcome.report.run.errors).toEqual([]);
@@ -164,7 +167,10 @@ describe('beforeStep and the run limits', () => {
     const { beforeStep } = holder(hold);
     const { outcome, project } = await runProjectWithConfigFile(
       { 'tests/block.e2e.ts': `import { test } from 'e2e';\ntest('blocks after a hold', async ({ app }) => { await app.open('/slow'); const end = Date.now() + 60_000; while (Date.now() < end) {} });\n` },
-      { configSource: workerFakeConfigSource(1, `\n  timeout: ${timeout},\n  cleanupTimeout: 500,`), runOptions: { beforeStep } },
+      {
+        configSource: workerFakeConfigSource(1, `\n  timeout: ${timeout},\n  cleanupTimeout: 500,`),
+        runOptions: { hold: beforeStep, holdSteps: true },
+      },
     );
     project.cleanup();
     const attempt = resultByTitle(outcome, 'blocks after a hold').attempts[0];
@@ -174,7 +180,7 @@ describe('beforeStep and the run limits', () => {
   }, 90_000);
 });
 
-describe('beforeStep ending a hold', () => {
+describe('the hold hook ending a hold', () => {
   it('fails a held step the body never awaited, and lets its hold go', async () => {
     const signals: AbortSignal[] = [];
     // The call sits in an async helper, whose own rejection must not reach the worker as a second error.
@@ -183,7 +189,8 @@ describe('beforeStep ending a hold', () => {
       {
         configSource: workerFakeConfigSource(1),
         runOptions: {
-          beforeStep: (_step, { signal }) => {
+          holdSteps: true,
+          hold: (_step, { signal }) => {
             signals.push(signal);
             return new Promise<void>(() => undefined);
           },
@@ -204,7 +211,7 @@ describe('beforeStep ending a hold', () => {
   ])('stops the run with the error a hook that %s gives, not as interrupted', async (_, beforeStep: () => Promise<void>) => {
     const { outcome, project } = await runProjectWithConfigFile(
       { 'tests/broken.e2e.ts': `import { test } from 'e2e';\ntest('meets a broken hook', async ({ app }) => { await app.open('/'); });\n` },
-      { configSource: workerFakeConfigSource(1), runOptions: { beforeStep } },
+      { configSource: workerFakeConfigSource(1), runOptions: { hold: beforeStep, holdSteps: true } },
     );
     project.cleanup();
     expect(outcome.report.run.errors.map((error) => error.message)).toContain('the prompt broke');
@@ -223,7 +230,8 @@ describe('beforeStep ending a hold', () => {
         configSource: workerFakeConfigSource(1),
         runOptions: {
           interruptSignal: interrupt.signal,
-          beforeStep: (_step, { signal }) => {
+          holdSteps: true,
+          hold: (_step, { signal }) => {
             signals.push(signal);
             interrupt.abort();
             return new Promise<void>(() => undefined);
@@ -241,7 +249,10 @@ describe('beforeStep ending a hold', () => {
   it('refuses the json reporter, whose stdout the prompt would break', async () => {
     const { outcome, project } = await runProjectWithConfigFile(
       { 'tests/any.e2e.ts': `import { test } from 'e2e';\ntest('never runs', async () => {});\n` },
-      { configSource: workerFakeConfigSource(1, `\n  reporters: ['json'],`), runOptions: { beforeStep: () => Promise.resolve() } },
+      {
+        configSource: workerFakeConfigSource(1, `\n  reporters: ['json'],`),
+        runOptions: { hold: () => Promise.resolve(), holdSteps: true },
+      },
     );
     project.cleanup();
     expect(outcome.exitCode).toBe(2);

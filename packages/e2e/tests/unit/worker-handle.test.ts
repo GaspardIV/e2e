@@ -81,7 +81,7 @@ describe('ChildProcessRunner', () => {
         sessionKeyBase64: '',
         debug: false,
         aiTrace: false,
-        step: undefined,
+        holding: { holdSteps: false, heldScreens: false },
         envFor: () => ({ ...process.env, NODE_OPTIONS: `--import ${pathToFileURL(preload).href}` }),
       });
       let exit: string | undefined;
@@ -142,7 +142,8 @@ describe('TargetWorker disposal', () => {
     }, async () => ({
       config, target: config.targets[0]!, sessionStore: SessionStore.create('run', tmpdir()),
       runId: 'run', artifactsRoot: tmpdir(), rerunDir: undefined, headed: false,
-      workerSlot: 0, env: {}, isolated: true, resolvePairs: async () => ({ pairs: [], missing: [] }),
+      workerSlot: 0, env: {}, isolated: true, holding: { holdSteps: false, heldScreens: false },
+      resolvePairs: async () => ({ pairs: [], missing: [] }),
     }));
     worker.start();
     await ready.promise;
@@ -182,7 +183,8 @@ describe('TargetWorker disposal', () => {
     }, async () => ({
       config, target: config.targets[0]!, sessionStore: SessionStore.create('run', tmpdir()),
       runId: 'run', artifactsRoot: tmpdir(), rerunDir: undefined, headed: false,
-      workerSlot: 0, env: {}, isolated: true, resolvePairs: async () => ({ pairs: [], missing: [] }),
+      workerSlot: 0, env: {}, isolated: true, holding: { holdSteps: false, heldScreens: false },
+      resolvePairs: async () => ({ pairs: [], missing: [] }),
     }));
     worker.start();
     await ready.promise;

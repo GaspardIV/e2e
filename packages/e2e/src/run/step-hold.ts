@@ -1,7 +1,7 @@
 /**
  * Holding steps for `e2e run --step`. A worker holds a top-level step before
- * it runs and asks the runner, which owns the terminal, whether it may; the
- * runner asks its `beforeStep` hook. While any step of an attempt is held, the
+ * it runs and asks the runner, which owns the terminal, whether it may. The
+ * runner asks its `hold` hook. While any step of an attempt is held, the
  * attempt's test clock is stopped, so the time a person spends looking at the
  * app is never charged to the test.
  */
@@ -11,8 +11,10 @@ import type { SourceLocation } from '@e2e-dev/core/lib/internal/source';
 import type { AttemptBudget } from '@e2e-dev/core/lib/run/budget';
 import type { StepHoldRequest } from '@e2e-dev/core/lib/run/steps';
 
-/** A step held before it runs, as the runner's `beforeStep` hook sees it. */
+/** A step held before it runs, as the runner's `hold` hook sees it. */
 export interface HeldStep {
+  /** See `StepHoldRequest.kind`. */
+  readonly kind: StepHoldRequest['kind'];
   readonly target: string;
   readonly testId: string;
   readonly agent: string;
@@ -33,11 +35,15 @@ export interface HeldStep {
 }
 
 /**
- * How a stepped run holds its steps: `hold` only holds them; `screen` also
- * reads the screen each hold starts on into `HeldStep.screen`, for a reader
- * who cannot see the app (`e2e run --step` without a terminal).
+ * How a run's workers make attempts wait. With `holdSteps`, every top-level
+ * step is held before it runs (`e2e run --step`). `heldScreens` reads the
+ * screen each wait starts on into `HeldStep.screen`, for a reader who can't
+ * see the app (an `e2e run --step` command).
  */
-export type StepHolding = 'hold' | 'screen';
+export interface HoldOptions {
+  readonly holdSteps: boolean;
+  readonly heldScreens: boolean;
+}
 
 /** A held step with its place among its test's held steps, from 1. */
 export interface NumberedStep {
@@ -53,7 +59,7 @@ export interface StepPrompt {
   readonly help: boolean;
 }
 
-/** What the runner hands `beforeStep` beside the step. */
+/** What the runner hands its `hold` hook beside the step. */
 export interface StepHoldContext {
   /** Aborts once the answer no longer matters: the step was abandoned, its attempt ended, or the run was interrupted. */
   readonly signal: AbortSignal;

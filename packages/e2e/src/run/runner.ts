@@ -48,7 +48,7 @@ import { allocateAppPorts } from './app-ports.ts';
 import { inProcessSpawner } from './in-process.ts';
 import { cleanupErrorsOf, someSkippedAfterFailure, tracedResultIds, type ResultRecord, type RunError, type SerialGroupRecord } from '@e2e-dev/core/lib/run/records';
 import { runUnits, type TargetFailure } from './scheduler.ts';
-import type { BeforeStep, HeldStep, StepHolding, StepPrompt } from './step-hold.ts';
+import type { BeforeStep, HeldStep, HoldOptions, StepPrompt } from './step-hold.ts';
 import { stepPromptLine } from '../report/list-steps.ts';
 import { buildWorkPlans, nonRunResult, orderWorkPlans, plannedSlots, type TargetWorkPlan, type TimeLimit } from './units.ts';
 import { SessionStore } from '@e2e-dev/core/lib/run/sessions';
@@ -221,16 +221,20 @@ export interface RunOptions {
    */
   forceSignal?: AbortSignal | undefined;
   /**
-   * Holds every top-level step of a test's first attempt, in `beforeEach`
-   * and the body, until it resolves (`e2e run --step`); setup tests and
-   * retries never wait. To stop, interrupt the run. While any step is held,
-   * the test's timeout and the time limit do not run, and the worker
-   * watchdog counts none of the held time.
-   * A rejection stops the run with its error. Refused with the json reporter,
-   * whose stdout the prompt would break.
+   * Answers each held step (`holdSteps`): the test waits until it resolves.
+   * A rejection stops the run with its error. While a step is held, the
+   * test's timeout and the time limit don't run, and the worker watchdog
+   * doesn't count any of that time. To stop, interrupt the run.
    */
-  beforeStep?: BeforeStep | undefined;
-  /** Whether each step `beforeStep` holds carries the screen it is held on (`HeldStep.screen`); `e2e run --step` without a terminal. */
+  hold?: BeforeStep | undefined;
+  /**
+   * Whether `hold` holds every top-level step of a test's first attempt, in
+   * `beforeEach` and the body (`e2e run --step`). Setup tests and retries
+   * never wait. Refused with the json reporter, whose stdout the prompt
+   * would break.
+   */
+  holdSteps?: boolean | undefined;
+  /** Whether each step `hold` holds carries the screen it is held on (`HeldStep.screen`), for `e2e run --step` without a terminal. */
   heldScreens?: boolean | undefined;
   /** A second sink on the run's event spine, beside the list reporter. */
   onEvent?: RunEventSink | undefined;
@@ -518,7 +522,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
   const listReporter =
     options.quiet === true || !reporterIds.includes('list')
       ? undefined
-      : new ListReporter(processOutput?.listOutput, { stepping: options.beforeStep !== undefined });
+      : new ListReporter(processOutput?.listOutput, { stepping: options.holdSteps === true });
   // Without the list reporter to print it under a heading, a test's output
   // goes to the terminal as written.
   const printsTestOutput = options.quiet !== true && listReporter === undefined;
@@ -817,7 +821,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
     recordFailure(loaded.error, 'config');
     return finish();
   }
-  if (options.beforeStep !== undefined && reporterIds.includes('json')) {
+  if (options.holdSteps === true && reporterIds.includes('json')) {
     recordFailure(
       new ConfigurationError('INVALID_CONFIG', '--step cannot run with the json reporter: the step prompt would land in its stdout document'),
       'config',
@@ -1085,7 +1089,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
       aiTraceRecorder = new AiTraceRecorder(processSecrets.redact);
       await registerAiTraceRecorder(aiTraceRecorder, loadAiSdk);
     }
-    const stepHolding: StepHolding | undefined = options.beforeStep === undefined ? undefined : options.heldScreens === true ? 'screen' : 'hold';
+    const holding: HoldOptions = { holdSteps: options.holdSteps === true, heldScreens: options.heldScreens === true };
     const spawn =
       workerConfigPath === undefined
         ? inProcessSpawner({
@@ -1098,7 +1102,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
             sessionStore: store,
             headed: options.headed ?? false,
             debug,
-            step: stepHolding,
+            holding,
             envFor: workerEnvFor(plans, env),
           })
         : childProcessSpawner({
@@ -1115,13 +1119,13 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
             sessionKeyBase64: store.exportKeyForWorker(),
             debug: debug.enabled,
             aiTrace: aiTrace !== undefined,
-            step: stepHolding,
+            holding,
             envFor: workerEnvFor(plans, env),
           });
 
     // The list reporter shows the prompt under its test; without it, the
     // prompt goes to stderr as one line, where a person still reads it.
-    const beforeStep = options.beforeStep;
+    const { hold } = options;
     let promptLine: string | undefined;
     const showStep = (prompt: StepPrompt | undefined): void => {
       if (listReporter !== undefined) {
@@ -1141,7 +1145,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
         ...(options.maxFailures === undefined ? {} : { maxFailures: options.maxFailures }),
         ...(timeLimit === undefined ? {} : { timeLimit }),
         spawn,
-        ...(beforeStep === undefined ? {} : { beforeStep: (step: HeldStep, signal: AbortSignal) => beforeStep(step, { signal, show: showStep }) }),
+        ...(hold === undefined ? {} : { beforeStep: (step: HeldStep, signal: AbortSignal) => hold(step, { signal, show: showStep }) }),
         interruptGraceMs: config.timeout + config.cleanupTimeout,
         interruptSignal: interrupted,
         forceSignal: forceController.signal,

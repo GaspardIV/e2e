@@ -338,16 +338,23 @@ export interface StepRecorderOptions {
    */
   readonly retainSteps?: number;
   /**
-   * Holds a top-level step of a phase that `holdable` allows until it may
-   * run (`e2e run --step`). It resolves when the step may run and rejects
-   * when it must not; `signal` aborts when the step is abandoned while held.
-   * No record of the step exists until the hold resolves.
+   * Makes the attempt wait before each step when `holdSteps` is on.
+   * Resolves to continue, and rejects to fail. `signal` aborts when the held
+   * step is abandoned. Without it, steps aren't held.
    */
-  readonly hold?: (step: StepHoldRequest, signal: AbortSignal) => Promise<void>;
+  readonly hold?: (request: StepHoldRequest, signal: AbortSignal) => Promise<void>;
+  /**
+   * Whether each top-level step of a phase that `holdable` allows waits at
+   * `hold` before it runs (`e2e run --step`). A held step isn't recorded until
+   * the hold resolves.
+   */
+  readonly holdSteps?: boolean;
 }
 
 /** A step about to wait at `StepRecorderOptions.hold`: what the person stepping through the test is shown. */
 export interface StepHoldRequest {
+  /** What waits: `step`, a held step before it runs (`holdSteps`). */
+  readonly kind: 'step';
   readonly api: string;
   /** Already redacted. */
   readonly label: string;
@@ -450,6 +457,7 @@ export class StepRecorder {
   /** Steps opened so far, the next step's index: `steps` may have dropped its oldest. */
   private opened = 0;
   private readonly hold: StepRecorderOptions['hold'];
+  private readonly holdSteps: boolean;
 
   constructor(
     private readonly attemptId: string,
@@ -464,6 +472,7 @@ export class StepRecorder {
     this.redactThrown = options.redactThrown === true;
     this.retainSteps = options.retainSteps;
     this.hold = options.hold;
+    this.holdSteps = options.holdSteps === true;
   }
 
   /** Replaces secret values in text the way every record is redacted; identity without a redactor. */
@@ -501,7 +510,7 @@ export class StepRecorder {
     const stack = stepStack(this.projectRoot);
     // A step inside another (an `onAction` hook's) or inside an `expect.poll`
     // read is part of what holds it, so only a top-level step waits.
-    if (this.hold !== undefined && this.holdable && parent === undefined && !insidePollRead()) {
+    if (this.hold !== undefined && this.holdSteps && this.holdable && parent === undefined && !insidePollRead()) {
       return this.runHeld(this.hold, { kind, api, label, stack, options, cancel: new AbortController(), promise: Promise.resolve() }, body);
     }
     return this.start(kind, api, label, stack, body, options, parent);
@@ -517,7 +526,7 @@ export class StepRecorder {
     this.held.add(call);
     const promise = (async () => {
       try {
-        await hold({ api: call.api, label: call.label, ...(source === undefined ? {} : { source }) }, call.cancel.signal);
+        await hold({ kind: 'step', api: call.api, label: call.label, ...(source === undefined ? {} : { source }) }, call.cancel.signal);
         // Released in the same turn the body abandoned it: it must not run.
         call.cancel.signal.throwIfAborted();
       } catch (cause) {

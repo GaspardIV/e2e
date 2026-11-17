@@ -1,8 +1,8 @@
 /**
  * `e2e run --step`: the run's first step runs on its own, then every later
- * one waits for a key. The runner holds each step through its `beforeStep`
- * hook; this module answers it from the keyboard, one prompt at a time, and
- * the runner draws the prompt.
+ * one waits for a key. The runner holds each step through its `hold` hook.
+ * This module answers it from the keyboard, one prompt at a time, and the
+ * runner draws the prompt.
  */
 
 import type { Keypress } from './keyboard.ts';
@@ -52,6 +52,9 @@ export function isStepAction(value: string | undefined): value is StepAction {
 /** How long a prompt ignores keys after it appears: a key pressed for the step before must not run this one. */
 const KEY_GUARD_MS = 150;
 
+/** How `StepGate.press` treats one key: `guard` false skips the key guard. */
+type PressOptions = { readonly guard: boolean };
+
 /** One held step waiting for its prompt, or showing it. */
 interface Waiting extends NumberedStep {
   readonly context: StepHoldContext;
@@ -87,21 +90,16 @@ export class StepGate {
   private show: StepHoldContext['show'] | undefined;
 
   private readonly now: () => number;
-  private readonly keyGuardMs: number;
 
-  /**
-   * `stop` interrupts the run. `keyGuardMs` defaults to `KEY_GUARD_MS`; a
-   * caller whose keys are commands, not presses that can repeat, passes 0.
-   */
+  /** `stop` interrupts the run. */
   constructor(
     private readonly stop: () => void,
-    options: { readonly now?: () => number; readonly keyGuardMs?: number } = {},
+    options: { readonly now?: () => number } = {},
   ) {
     this.now = options.now ?? Date.now;
-    this.keyGuardMs = options.keyGuardMs ?? KEY_GUARD_MS;
   }
 
-  /** The runner's `beforeStep` hook. */
+  /** The runner's `hold` hook. */
   readonly beforeStep: BeforeStep = (step, context) => {
     // A hold that ended before it arrived has nobody to answer.
     if (context.signal.aborted) return Promise.resolve();
@@ -135,14 +133,22 @@ export class StepGate {
     });
   };
 
-  /** Acts on one key. Ctrl-C works at any time; the others only on a prompt, once it has been up for the key guard. */
-  press(key: Exclude<StepKey, 'suspend'>): void {
+  /**
+   * Acts on one key. Ctrl-C works at any time. The other keys work only on a
+   * prompt, once it has been up for the key guard. `guard` false skips the
+   * guard, for a command, which is never a key pressed for the prompt before.
+   */
+  press(key: Exclude<StepKey, 'suspend'>, options: PressOptions = { guard: true }): void {
     if (key === 'interrupt') {
       this.stop();
       return;
     }
     const shown = this.queue[0];
-    if (shown === undefined || this.now() - this.shownAt < this.keyGuardMs) return;
+
+    if (shown === undefined || (options.guard && this.now() - this.shownAt < KEY_GUARD_MS)) {
+      return;
+    }
+
     const test = testKey(shown.step);
     switch (key) {
       case 'continue':

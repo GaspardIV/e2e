@@ -101,11 +101,16 @@ export interface TargetExecutorOptions extends EngineSessionsOptions {
    */
   readonly isolated: boolean;
   /**
-   * Holds each top-level step of a test's first attempt until the runner
-   * lets it run (`e2e run --step`); it resolves to run the step. Setup tests
-   * and retries never wait.
+   * Makes an attempt wait until the runner lets it continue, and resolves
+   * when it may. Every held step (`holdSteps`) comes here. Without it,
+   * steps aren't held.
    */
-  readonly holdStep?: ((step: HeldStep, signal: AbortSignal) => Promise<void>) | undefined;
+  readonly hold?: ((step: HeldStep, signal: AbortSignal) => Promise<void>) | undefined;
+  /**
+   * Whether each top-level step of a test's first attempt waits at `hold`
+   * before it runs (`e2e run --step`). Setup tests and retries never wait.
+   */
+  readonly holdSteps?: boolean | undefined;
   /** Whether each hold reads the screen it starts on into `HeldStep.screen`. */
   readonly heldScreens?: boolean | undefined;
   readonly events?: ExecutionEvents;
@@ -514,9 +519,14 @@ export class TargetExecutor extends EngineSessions implements SerialHost {
     const redact = (text: string): string => redactForSession(openSession ?? undefined, this.config.allSecrets, text);
     // Set once the test clock exists, before the first step that could wait.
     let holds: AttemptHolds | undefined;
-    const holdStep = context.kind === 'setup' || attemptIndex > 0 ? undefined : this.options.holdStep;
+    const hold = context.kind === 'setup' || attemptIndex > 0 ? undefined : this.options.hold;
     const steps = new StepRecorder(attemptId, {
-      ...(holdStep === undefined ? {} : { hold: (step: StepHoldRequest, signal: AbortSignal) => holds?.hold(step, signal) ?? Promise.resolve() }),
+      ...(hold === undefined
+        ? {}
+        : {
+            hold: (request: StepHoldRequest, signal: AbortSignal) => holds?.hold(request, signal) ?? Promise.resolve(),
+            holdSteps: this.options.holdSteps === true,
+          }),
       attempt: { id: shared?.attemptId ?? attemptId, index: attemptIndex },
       maxEventsPerStep: this.config.limits.maxEventsPerStep,
       projectRoot: this.config.projectRoot,
@@ -693,7 +703,7 @@ export class TargetExecutor extends EngineSessions implements SerialHost {
       const testDeadline = new Deadline(pair.options.timeout);
       this.options.events?.onAttemptDeadline?.(pair, { index: attemptIndex, id: attemptId, startedAt });
       const budget = new AttemptBudget(attemptAbort.signal, testDeadline);
-      if (holdStep !== undefined) {
+      if (hold !== undefined) {
         const title = pair.test.titlePath.join(' › ');
         // Steps held together (one `Promise.all`) wait on one screen, read once.
         let heldScreen: Promise<string | undefined> | undefined;
@@ -702,8 +712,9 @@ export class TargetExecutor extends EngineSessions implements SerialHost {
           signal: attemptAbort.signal,
           ask: async (step, signal) => {
             const screen = this.options.heldScreens === true ? await (heldScreen ??= this.readHeldScreen(session, attemptId, signal)) : undefined;
-            await holdStep(
+            await hold(
               {
+                kind: step.kind,
                 target: this.target.name,
                 testId: pair.test.id,
                 agent: pair.agent,

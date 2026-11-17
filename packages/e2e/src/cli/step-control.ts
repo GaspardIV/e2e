@@ -12,11 +12,8 @@
  */
 
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
-import path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import picocolors from 'picocolors';
 import { z } from 'zod';
@@ -25,6 +22,7 @@ import { stepLine, stepPromptText } from '../report/list-steps.ts';
 import type { RunEventSink } from '../run/events.ts';
 import { run, type RunOptions, type RunOutcome } from '../run/runner.ts';
 import type { BeforeStep, StepPrompt } from '../run/step-hold.ts';
+import { parseLine, type StepAddress } from '../run/step-socket.ts';
 import type { SignalLadder } from './signals.ts';
 import { STEP_ACTIONS, StepGate, type StepAction } from './step.ts';
 
@@ -36,13 +34,6 @@ import { STEP_ACTIONS, StepGate, type StepAction } from './step.ts';
 const StepRequest = z.object({ action: z.enum(STEP_ACTIONS), log: z.string().optional() });
 const StepReply = z.object({ text: z.string(), exitCode: z.number() });
 type StepReply = z.infer<typeof StepReply>;
-
-/** Where a stepped run listens, the lock it holds while it claims that, and the file its output goes to (one per starting command). */
-export interface StepAddress {
-  readonly socket: string;
-  readonly lock: string;
-  readonly log: string;
-}
 
 /** How long a stepped run holds a step with no command acting on it before it stops, and keeps its end for a command after it ended with none waiting. */
 const IDLE_STOP_MS = 30 * 60_000;
@@ -58,38 +49,6 @@ const FLUSH_MS = 5_000;
 const ENDED = 'The stepped run has ended.\n';
 /** Why a second start is refused; a word that is not an action reads as a file and lands here too. */
 const ALREADY_GOING = 'a stepped run is already going in this directory: drive it with e2e run --step next, rest, or stop';
-
-/**
- * Where the stepped run started from `cwd` listens and logs. The directory
- * holding them is created for this user alone, and refused when someone else
- * owns it or can read it: the socket drives the run and the log holds its output.
- */
-export function stepAddress(cwd: string): StepAddress {
-  const id = createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 16);
-  const uid = process.getuid?.();
-  const dir = path.join(os.tmpdir(), uid === undefined ? 'e2e-step' : `e2e-step-${uid}`);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (uid !== undefined) {
-    const stat = fs.lstatSync(dir);
-    if (!stat.isDirectory() || stat.uid !== uid || (stat.mode & 0o077) !== 0) {
-      throw new Error(`${dir} must be a directory only you can open; remove it and run again`);
-    }
-  }
-  return {
-    socket: process.platform === 'win32' ? String.raw`\\.\pipe\e2e-step-` + id : path.join(dir, `${id}.sock`),
-    lock: path.join(dir, `${id}.lock`),
-    log: path.join(dir, `${id}-${process.pid}.log`),
-  };
-}
-
-/** One JSON message `schema` reads, or undefined when the line is not one. */
-function parseLine<T>(line: string, schema: z.ZodType<T>): T | undefined {
-  try {
-    return schema.parse(JSON.parse(line));
-  } catch {
-    return undefined;
-  }
-}
 
 /**
  * Sends one request and reads the answer. `absent` when nothing listens;
@@ -251,6 +210,51 @@ async function claim(server: net.Server, address: StepAddress): Promise<void> {
 }
 
 /**
+ * Answers every waiting command with `reply`, each opened by its note. Each
+ * connection's close goes into `sent`, which the run waits for before it
+ * ends, since its exit doesn't wait for sockets.
+ */
+function answerWaiting(waiting: Map<net.Socket, string>, reply: StepReply, sent: Promise<unknown>[]): void {
+  for (const [client, note] of waiting) {
+    sent.push(new Promise((resolve) => client.once('close', resolve)));
+    client.end(`${JSON.stringify({ text: note + reply.text, exitCode: reply.exitCode } satisfies StepReply)}\n`);
+  }
+  waiting.clear();
+}
+
+/**
+ * A server that reads one request from each connection: a command goes to
+ * `step`. A connection that sends anything else is dropped.
+ */
+function commandServer(handle: {
+  readonly step: (client: net.Socket, request: z.infer<typeof StepRequest>) => void;
+}): net.Server {
+  return net.createServer((client) => {
+    let received = '';
+    client.setEncoding('utf8');
+    client.on('error', () => undefined);
+    const onData = (chunk: string): void => {
+      received += chunk;
+      const end = received.indexOf('\n');
+
+      if (end === -1) {
+        return;
+      }
+
+      client.off('data', onData);
+      const request = parseLine(received.slice(0, end), StepRequest);
+
+      if (request === undefined) {
+        client.destroy();
+      } else {
+        handle.step(client, request);
+      }
+    };
+    client.on('data', onData);
+  });
+}
+
+/**
  * The background run: runs the tests with every later step held, and
  * answers commands on `address.socket`. A command applies its action, then
  * gets its answer when the run holds a step no command has printed yet, or
@@ -273,7 +277,7 @@ export async function serveSteps(options: RunOptions, signals: SignalLadder, add
   let held = false;
   /** Each waiting command, with the note its answer opens with when its action was not applied. */
   const waiting = new Map<net.Socket, string>();
-  /** Answers on their way out, which the run waits for before it ends: its exit does not wait for sockets. */
+  /** Answers on their way out, which the run waits for before it ends. */
   const sent: Promise<unknown>[] = [];
   let joining: NodeJS.Timeout | undefined;
   let idle: NodeJS.Timeout | undefined;
@@ -285,7 +289,7 @@ export async function serveSteps(options: RunOptions, signals: SignalLadder, add
     stopping = true;
     signals.escalate();
   };
-  const gate = new StepGate(stop, { keyGuardMs: 0 });
+  const gate = new StepGate(stop);
   /** Answers every waiting command, once there is a step no command has printed, or the end. */
   const answer = (): void => {
     const reply = ended ?? (unseen !== undefined && !stopping ? { text: stepPromptText(unseen), exitCode: 0 } : undefined);
@@ -294,12 +298,7 @@ export async function serveSteps(options: RunOptions, signals: SignalLadder, add
     answered = true;
     const since = readSince(address.log, printed);
     printed = since.offset;
-    for (const [client, note] of waiting) {
-      const line = `${JSON.stringify({ text: note + since.text + reply.text, exitCode: reply.exitCode } satisfies StepReply)}\n`;
-      sent.push(new Promise((resolve) => client.once('close', resolve)));
-      client.end(line);
-    }
-    waiting.clear();
+    answerWaiting(waiting, { text: since.text + reply.text, exitCode: reply.exitCode }, sent);
     if (reply === ended) endSent?.();
   };
   /** Answers a moment later, so the steps of one `Promise.all` held one after another share the answer. */
@@ -315,12 +314,19 @@ export async function serveSteps(options: RunOptions, signals: SignalLadder, add
   const apply = (action: StepAction, starting: boolean): string => {
     // The run is over; the command gets its end.
     if (ended !== undefined) return action === 'stop' || starting ? '' : `e2e run --step ${action} was not applied: the run had ended.\n`;
-    if (action === 'stop') stop();
-    // The starting command waits for the first held step and presses nothing.
-    else if (starting) return '';
-    else if (unseen !== undefined) return `e2e run --step ${action} was not applied: the step below was held while no command waited, so it shows first.\n`;
-    else if (!held) return `e2e run --step ${action} was not applied: it came while a step ran, so it waited for the next pause or the end; send it again to apply it.\n`;
-    else gate.press(action === 'next' ? 'continue' : 'rest');
+    if (action === 'stop') {
+      stop();
+    } else if (starting) {
+      // The starting command waits for the first held step and presses nothing.
+      return '';
+    } else if (unseen !== undefined) {
+      return `e2e run --step ${action} was not applied: the step below was held while no command waited, so it shows first.\n`;
+    } else if (!held) {
+      return `e2e run --step ${action} was not applied: it came while a step ran, so it waited for the next pause or the end; send it again to apply it.\n`;
+    } else {
+      gate.press(action === 'next' ? 'continue' : 'rest', { guard: false });
+    }
+
     return '';
   };
   /** A held step nobody acts on stops the run, so an abandoned one does not keep its app and browser. */
@@ -340,26 +346,12 @@ export async function serveSteps(options: RunOptions, signals: SignalLadder, add
     answerSoon();
   };
 
-  const server = net.createServer((client) => {
-    let received = '';
-    client.setEncoding('utf8');
-    client.on('error', () => undefined);
-    const onData = (chunk: string): void => {
-      received += chunk;
-      const end = received.indexOf('\n');
-      if (end === -1) return;
-      client.off('data', onData);
-      const request = parseLine(received.slice(0, end), StepRequest);
-      if (request === undefined) client.destroy();
-      else handle(client, request);
-    };
-    client.on('data', onData);
-  });
+  const server = commandServer({ step: handle });
   await claim(server, address);
 
   const beforeStep: BeforeStep = (step, context) =>
     gate.beforeStep(step, {
-      signal: context.signal,
+      ...context,
       show: (shown) => {
         unseen = shown;
         held = shown !== undefined;
@@ -384,7 +376,7 @@ export async function serveSteps(options: RunOptions, signals: SignalLadder, add
     return options.onEvent?.(event);
   };
   try {
-    const outcome = await run({ ...options, beforeStep, onEvent, heldScreens: true });
+    const outcome = await run({ ...options, hold: beforeStep, holdSteps: true, onEvent, heldScreens: true });
     ended = { text: ENDED, exitCode: outcome.exitCode };
     return outcome;
   } catch (cause) {
