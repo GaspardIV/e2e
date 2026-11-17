@@ -1,0 +1,125 @@
+/** `e2e report` resolution, error handling, and safe platform browser commands. */
+
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { report } from '../../src/cli/report.ts';
+import { platformOpenCommand, spawnBrowserCommand } from '../../src/internal/open-browser.ts';
+import { browserCommand } from '../../src/oauth/browser.ts';
+
+let root: string;
+let stdoutSpy: ReturnType<typeof vi.spyOn>;
+let stderrSpy: ReturnType<typeof vi.spyOn>;
+
+function written(spy: ReturnType<typeof vi.spyOn>): string {
+  return stripVTControlCharacters(spy.mock.calls.map((call: readonly unknown[]) => String(call[0])).join(''));
+}
+
+beforeEach(() => {
+  root = mkdtempSync(path.join(os.tmpdir(), 'e2e-report-'));
+  stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+  stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+});
+
+afterEach(() => {
+  stdoutSpy.mockRestore();
+  stderrSpy.mockRestore();
+  rmSync(root, { recursive: true, force: true });
+});
+
+describe('e2e report', () => {
+  it('opens the default .e2e/report.html when no config exists', async () => {
+    const file = path.join(root, '.e2e', 'report.html');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, '<html></html>', 'utf8');
+    const opened: string[] = [];
+
+    const code = await report({ cwd: root, open: (url) => opened.push(url) });
+
+    expect(code).toBe(0);
+    expect(opened).toEqual([pathToFileURL(file).href]);
+    expect(written(stdoutSpy)).toContain(pathToFileURL(file).href);
+  });
+
+  it('uses the configured output directory from e2e.config.ts and allows --output to override it', async () => {
+    writeFileSync(
+      path.join(root, 'e2e.config.ts'),
+      "export default { targets: [{ name: 'web', platform: 'web' }], output: 'artifacts/run' };\n",
+      'utf8',
+    );
+    const configured = path.join(root, 'artifacts', 'run', 'report.html');
+    const overridden = path.join(root, 'custom-out', 'report.html');
+    mkdirSync(path.dirname(configured), { recursive: true });
+    mkdirSync(path.dirname(overridden), { recursive: true });
+    writeFileSync(configured, '<html></html>', 'utf8');
+    writeFileSync(overridden, '<html></html>', 'utf8');
+
+    const openedConfigured: string[] = [];
+    expect(await report({ cwd: root, open: (url) => openedConfigured.push(url) })).toBe(0);
+    expect(openedConfigured).toEqual([pathToFileURL(configured).href]);
+
+    const openedOverridden: string[] = [];
+    expect(await report({ cwd: root, output: 'custom-out', open: (url) => openedOverridden.push(url) })).toBe(0);
+    expect(openedOverridden).toEqual([pathToFileURL(overridden).href]);
+  });
+
+  it('accepts an explicit file path or directory containing report.html', async () => {
+    const customFile = path.join(root, 'custom.html');
+    const dirReport = path.join(root, 'bundle', 'report.html');
+    writeFileSync(customFile, '<html></html>', 'utf8');
+    mkdirSync(path.dirname(dirReport), { recursive: true });
+    writeFileSync(dirReport, '<html></html>', 'utf8');
+
+    const opened: string[] = [];
+    expect(await report({ cwd: root, path: 'custom.html', open: (url) => opened.push(url) })).toBe(0);
+    expect(await report({ cwd: root, path: 'bundle', open: (url) => opened.push(url) })).toBe(0);
+    expect(opened).toEqual([pathToFileURL(customFile).href, pathToFileURL(dirReport).href]);
+  });
+
+  it('exits 2 when the report file is missing, directory has no report.html, or both [path] and --output are given', async () => {
+    const opened: string[] = [];
+
+    expect(await report({ cwd: root, open: (url) => opened.push(url) })).toBe(2);
+    expect(written(stderrSpy)).toContain('htmlReporter()');
+
+    const emptyDir = path.join(root, 'empty-dir');
+    mkdirSync(emptyDir, { recursive: true });
+    expect(await report({ cwd: root, path: 'empty-dir', open: (url) => opened.push(url) })).toBe(2);
+
+    expect(await report({ cwd: root, path: 'a.html', output: 'out', open: (url) => opened.push(url) })).toBe(2);
+    expect(written(stderrSpy)).toContain('pass either [path] or --output, not both');
+    expect(opened).toEqual([]);
+  });
+
+  it('reports launcher spawn failures through onError instead of throwing', async () => {
+    const errors: unknown[] = [];
+    spawnBrowserCommand({ command: 'nonexistent-e2e-browser-opener-binary', args: ['file:///tmp/report.html'] }, (cause) => {
+      errors.push(cause);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(errors.length).toBeGreaterThan(0);
+  });
+
+  it('builds safe per-OS opener commands without a shell while keeping OAuth http/https-only', () => {
+    expect(platformOpenCommand('win32', 'file:///C:/a/report.html')).toEqual({
+      command: 'rundll32',
+      args: ['url.dll,FileProtocolHandler', 'file:///C:/a/report.html'],
+    });
+    expect(platformOpenCommand('darwin', 'file:///tmp/report.html')).toEqual({
+      command: 'open',
+      args: ['file:///tmp/report.html'],
+    });
+    expect(platformOpenCommand('linux', 'file:///tmp/report.html')).toEqual({
+      command: 'xdg-open',
+      args: ['file:///tmp/report.html'],
+    });
+    expect(browserCommand('win32', 'file:///C:/a/report.html')).toBeUndefined();
+    expect(browserCommand('win32', 'https://example.com/auth')).toEqual({
+      command: 'rundll32',
+      args: ['url.dll,FileProtocolHandler', 'https://example.com/auth'],
+    });
+  });
+});
