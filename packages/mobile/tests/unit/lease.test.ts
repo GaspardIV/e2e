@@ -154,7 +154,9 @@ describe('agentDeviceLeases()', () => {
         leases().acquire(request({ log: () => { throw new Error('log closed'); } }), allocation),
       ).rejects.toThrow('log closed');
       await releaseCalled;
-      await vi.advanceTimersByTimeAsync(12_000);
+      await vi.advanceTimersByTimeAsync(11_999);
+      expect(mocks.stop).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
       await pending;
       const stopSignal = mocks.stop.mock.calls[0]?.[4];
       expect(stopSignal).toBeInstanceOf(AbortSignal);
@@ -265,7 +267,9 @@ describe('agentDeviceLeases()', () => {
 
       const pending = provider.release(lease, { ...context, signal: outer.signal });
       await releaseCalled;
-      await vi.advanceTimersByTimeAsync(12_000);
+      await vi.advanceTimersByTimeAsync(11_999);
+      expect(mocks.stop).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
       await pending;
 
       expect(mocks.releaseLease).toHaveBeenCalledTimes(1);
@@ -290,6 +294,29 @@ describe('agentDeviceLeases()', () => {
 
       expect(stopSignalWhenExpired).toBe(expiredOuter.signal);
       expect(stopSignalWhenExpired?.aborted).toBe(true);
+
+      const shortLease = await provider.acquire(request({ slot: 2 }), allocation);
+      const shortBudget = new AbortController();
+      const shortTimer = setTimeout(() => shortBudget.abort(new Error('short cleanup budget exhausted')), 10_000);
+      let stopSignalOnShortBudget: AbortSignal | undefined;
+      const shortReleaseCalled = new Promise<void>((resolve) => {
+        mocks.releaseLease.mockImplementationOnce(hangUntilAborted(resolve));
+      });
+      mocks.stop.mockImplementationOnce(async (_stateDir, _env, _id, _label, signal) => {
+        stopSignalOnShortBudget = signal;
+      });
+
+      const pendingShort = provider.release(shortLease, { ...context, signal: shortBudget.signal, timeoutMs: 10_000 });
+      await shortReleaseCalled;
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(mocks.stop).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mocks.stop).toHaveBeenCalledTimes(3);
+      await pendingShort;
+      clearTimeout(shortTimer);
+
+      expect(stopSignalOnShortBudget).toBe(shortBudget.signal);
+      expect(stopSignalOnShortBudget?.aborted).toBe(false);
     } finally {
       vi.useRealTimers();
     }
