@@ -53,7 +53,11 @@ export interface AgentDeviceLeases {
   release(lease: DeviceLease, context: DeviceReleaseContext): Promise<void>;
 }
 
-/** One lease's daemon; `sessionEnded` once RPC release confirmed it and `ended` once stopped too, so a retried release skips what already finished. */
+const RELEASE_RPC_TIMEOUT_MS = 12_000;
+
+type LeaseStage = 'held' | 'session-ended' | 'stopped';
+
+/** One lease's daemon lifecycle: RPC release moves `'held'` to `'session-ended'`, stop moves it to `'stopped'`, so a retry skips finished steps. */
 interface Held {
   dir: string;
   stateDir: string;
@@ -61,8 +65,7 @@ interface Held {
   scope?: LeaseScopedOptions;
   stopHeartbeat?: () => Promise<void>;
   releasing?: Promise<void> | undefined;
-  sessionEnded?: boolean;
-  ended?: boolean;
+  stage: LeaseStage;
 }
 
 /**
@@ -75,12 +78,12 @@ export function agentDeviceLeases({ provider, label }: AgentDeviceLeaseOptions):
   const held = new Map<string, Held>();
 
   /** One release per lease, shared by every caller; a failed one may be tried again. */
-  function release(id: string | undefined, resource: Held, signal: AbortSignal, createStopSignal?: () => AbortSignal): Promise<void> {
+  function release(id: string | undefined, resource: Held, signal: AbortSignal): Promise<void> {
     resource.releasing ??= (async () => {
       await resource.stopHeartbeat?.();
-      if (resource.ended !== true) {
-        await endLeaseDaemon(id, resource, label, signal, createStopSignal);
-        resource.ended = true;
+      if (resource.stage !== 'stopped') {
+        await endLeaseDaemon(id, resource, label, signal);
+        resource.stage = 'stopped';
       }
       await rm(resource.dir, { recursive: true, force: true });
       if (id !== undefined) held.delete(id);
@@ -94,7 +97,7 @@ export function agentDeviceLeases({ provider, label }: AgentDeviceLeaseOptions):
       request.signal.throwIfAborted();
       const dir = await mkdtemp(join(tmpdir(), `e2e-${provider}-`));
       const home = join(dir, 'home');
-      const resource: Held = { dir, stateDir: join(dir, 'state'), env: daemonEnv({ ...request.env, ...env }, home) };
+      const resource: Held = { dir, stateDir: join(dir, 'state'), env: daemonEnv({ ...request.env, ...env }, home), stage: 'held' };
       const leaseBackend: 'ios-instance' | 'android-instance' = request.platform === 'ios' ? 'ios-instance' : 'android-instance';
       const allocated = { platform: request.platform, target: 'mobile' as const, ...selectors };
       let id: string | undefined;
@@ -128,8 +131,7 @@ export function agentDeviceLeases({ provider, label }: AgentDeviceLeaseOptions):
       } catch (cause) {
         // The engine releases only leases `acquire` returned.
         try {
-          // Give stopDriver its own fresh budget so a timed-out RPC release never aborts daemon stop before it spawns.
-          await release(id, resource, AbortSignal.timeout(20_000), () => AbortSignal.timeout(15_000));
+          await release(id, resource, AbortSignal.timeout(30_000));
         } catch (cleanup) {
           throw new AggregateError([cause, cleanup], `${label} lease failed: ${messageOf(cause)}; cleanup also failed: ${messageOf(cleanup)}`, { cause: cleanup });
         }
@@ -160,36 +162,44 @@ async function endLeaseDaemon(
   resource: Held,
   label: string,
   signal: AbortSignal,
-  createStopSignal?: () => AbortSignal,
 ): Promise<void> {
   let releaseError: unknown;
-  if (resource.sessionEnded !== true && resource.scope !== undefined) {
+  if (resource.stage === 'held' && resource.scope !== undefined) {
+    // Cap the RPC below the caller's cleanup budget so a hung provider DELETE never exhausts `signal` before `stopDriver` spawns.
+    const rpcTimeout = new AbortController();
+    const timer = setTimeout(
+      () => rpcTimeout.abort(new DOMException('Timed out waiting for lease RPC release', 'TimeoutError')),
+      RELEASE_RPC_TIMEOUT_MS,
+    );
+    timer.unref?.();
+    const rpcSignal = AbortSignal.any([signal, rpcTimeout.signal]);
     try {
-      resource.sessionEnded = await releaseLease(resource.stateDir, resource.scope, signal);
+      if (await releaseLease(resource.stateDir, resource.scope, rpcSignal)) {
+        resource.stage = 'session-ended';
+      }
     } catch (error) {
       releaseError = error;
+    } finally {
+      clearTimeout(timer);
     }
   }
-  const stopSignal = createStopSignal ? createStopSignal() : signal;
   try {
-    if (resource.sessionEnded) {
-      await stopDriver(resource.stateDir, resource.env, id, label, stopSignal, { sessionEnded: true });
-    } else {
-      await stopDriver(resource.stateDir, resource.env, id, label, stopSignal);
-    }
+    await stopDriver(resource.stateDir, resource.env, id, label, signal, {
+      sessionEnded: resource.stage === 'session-ended',
+    });
   } catch (stopError) {
-    if (shouldCombineReleaseError(releaseError, stopError)) {
-      throw new AggregateError([releaseError, stopError], `${label} lease release failed: ${messageOf(releaseError)}; ${messageOf(stopError)}`, { cause: stopError });
+    // When the daemon died mid-run, `stopDriver` already reports the missing daemon for the lease.
+    const daemonNotRunning =
+      isAgentDeviceError(releaseError) && releaseError.details?.reason === 'daemon-not-running';
+    if (releaseError !== undefined && !daemonNotRunning) {
+      throw new AggregateError(
+        [releaseError, stopError],
+        `${label} lease release failed: ${messageOf(releaseError)}; ${messageOf(stopError)}`,
+        { cause: stopError },
+      );
     }
     throw stopError;
   }
-}
-
-function shouldCombineReleaseError(releaseError: unknown, stopError: unknown): boolean {
-  if (releaseError === undefined) return false;
-  // When the daemon died mid-run, `stopDriver` already reports the missing daemon for the lease.
-  if (isAgentDeviceError(releaseError) && releaseError.details?.reason === 'daemon-not-running') return false;
-  return messageOf(releaseError) !== messageOf(stopError);
 }
 
 function messageOf(cause: unknown): string {

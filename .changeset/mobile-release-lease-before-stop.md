@@ -2,4 +2,4 @@
 '@e2e-dev/mobile': patch
 ---
 
-Release each leased cloud device session explicitly through the running daemon before stopping the daemon, so ending provider sessions does not depend on daemon shutdown signals on Windows or shutdown-window timeouts.
+Fix BrowserStack and TestMu AI runs on Windows failing during cleanup with `could not confirm its sessions ended` and leaving the device session open until idle timeout, and fail the release when the service rejects ending the session.

@@ -83,8 +83,11 @@ it('attaches to release a lease without spawning a daemon when none is running',
 
 it('rejects when leases.release reports provider cleanup warnings even if released is true', async () => {
   const mockedClient = vi.mocked(createAgentDeviceClient);
+  const realClient = createAgentDeviceClient({ stateDir: path.join(dir, 'warn-state'), daemonLifecycle: 'attach' });
   mockedClient.mockReturnValueOnce({
+    ...realClient,
     leases: {
+      ...realClient.leases,
       release: async () => ({
         released: true,
         provider: {
@@ -94,7 +97,7 @@ it('rejects when leases.release reports provider cleanup warnings even if releas
         },
       }),
     },
-  } as never);
+  });
   await expect(
     releaseLease(path.join(dir, 'warn-state'), { leaseId: 'lease-1', tenant: 'browserstack', runId: 'run-1', leaseBackend: 'ios-instance', leaseProvider: 'browserstack' }, AbortSignal.timeout(10_000)),
   ).rejects.toThrow('WEBDRIVER_SESSION_DELETE_FAILED: HTTP 500 on DELETE /session/wd-1');
