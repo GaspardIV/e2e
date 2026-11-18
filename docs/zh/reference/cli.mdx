@@ -1067,7 +1067,7 @@ E2E_TELEMETRY_DEBUG=1 bunx e2e run
 
 #### `e2e report`
 
-在默认浏览器中打开 [`htmlReporter()`](/reference/reporters#htmlreporter) 生成的 HTML 报告（默认为 `.e2e/report.html`）。找不到报告文件时以退出码 `2` 退出。
+在默认浏览器中打开 [`htmlReporter()`](/reference/reporters#htmlreporter) 生成的 HTML 报告（默认为 `<output>/report.html`）。找不到或无法读取报告文件，或同时传入 `[path]` 和 `--output` 时，以退出码 `2` 退出。
 
 <CodeGroup>
 ```bash npm
@@ -1091,7 +1091,7 @@ bunx e2e report --output out
 
 | 参数或标志 | 含义 |
 | --- | --- |
-| `[path]` | HTML 文件或包含 `report.html` 的目录（默认：`<output>/report.html`） |
+| `[path]` | HTML 文件或包含 `report.html` 的目录（默认：`<output>/report.html`，不可与 `--output` 同时使用） |
 | `--config <path>` | 配置文件（默认：最近的 `e2e.config.ts`、`.mts`、`.js` 或 `.mjs`） |
 | `--output <dir>` | 包含 `report.html` 的结果目录（默认：配置中的 `output`，否则为 `.e2e`） |
 

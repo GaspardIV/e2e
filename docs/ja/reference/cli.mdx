@@ -1067,7 +1067,7 @@ E2E_TELEMETRY_DEBUG=1 bunx e2e run
 
 #### `e2e report`
 
-[`htmlReporter()`](/reference/reporters#htmlreporter) が書き出した HTML レポートを既定のブラウザーで開きます（デフォルトは `.e2e/report.html`）。レポートファイルが見つからない場合は終了コード `2` で終了します。
+[`htmlReporter()`](/reference/reporters#htmlreporter) が書き出した HTML レポートを既定のブラウザーで開きます（デフォルトは `<output>/report.html`）。読み取れるレポートファイルが見つからない場合、または `[path]` と `--output` の両方が渡された場合は終了コード `2` で終了します。
 
 <CodeGroup>
 ```bash npm
@@ -1091,7 +1091,7 @@ bunx e2e report --output out
 
 | 引数またはフラグ | 説明 |
 | --- | --- |
-| `[path]` | HTML ファイルまたは `report.html` を含むディレクトリ（デフォルト: `<output>/report.html`） |
+| `[path]` | HTML ファイルまたは `report.html` を含むディレクトリ（デフォルト: `<output>/report.html`、`--output` とは併用不可） |
 | `--config <path>` | 設定ファイル（デフォルト: 最も近い `e2e.config.ts`、`.mts`、`.js`、`.mjs`） |
 | `--output <dir>` | `report.html` がある結果ディレクトリ（デフォルト: 設定の `output`、なければ `.e2e`） |
 

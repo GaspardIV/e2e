@@ -1408,8 +1408,8 @@ E2E_TELEMETRY_DEBUG=1 bunx e2e run
 #### `e2e report`
 
 Opens the HTML report written by [`htmlReporter()`](/reference/reporters#htmlreporter)
-in the default browser (`.e2e/report.html` by default). Exits `2` when no
-report file is found.
+in the default browser (`<output>/report.html` by default). Exits `2` when no
+readable report file is found or both `[path]` and `--output` are passed.
 
 <CodeGroup>
 ```bash npm
@@ -1433,7 +1433,7 @@ bunx e2e report --output out
 
 | Argument or flag | Meaning |
 | --- | --- |
-| `[path]` | HTML file or directory holding `report.html` (default: `<output>/report.html`) |
+| `[path]` | HTML file or directory holding `report.html` (default: `<output>/report.html`; mutually exclusive with `--output`) |
 | `--config <path>` | Config file (default: the nearest `e2e.config.ts`, `.mts`, `.js`, or `.mjs`) |
 | `--output <dir>` | Results directory containing `report.html` (default: `output` in the config, else `.e2e`) |
 
