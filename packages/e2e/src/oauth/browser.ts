@@ -16,8 +16,6 @@
 
 import { platformOpenCommand, type BrowserCommand } from '../internal/open-browser.ts';
 
-export type { BrowserCommand };
-
 /** The schemes the opener opens, the ones a browser can follow. */
 const OPENABLE_PROTOCOLS = new Set(['http:', 'https:']);
 

@@ -1437,6 +1437,8 @@ bunx e2e report --output out
 | `--config <path>` | Config file (default: the nearest `e2e.config.ts`, `.mts`, `.js`, or `.mjs`) |
 | `--output <dir>` | Results directory containing `report.html` (default: `output` in the config, else `.e2e`) |
 
+- If [`htmlReporter({ outputFile })`](/reference/reporters#htmlreporter) writes the page elsewhere, pass that path as `[path]`: `e2e report` checks `<output>/report.html` only.
+
 ## Exit codes
 
 | Code | Meaning |

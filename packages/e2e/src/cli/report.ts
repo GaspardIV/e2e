@@ -5,7 +5,7 @@
 import { access, constants, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { resolveProjectConfig } from '@e2e-dev/core/lib/config/resolve';
+import { resolveOutputDir } from '@e2e-dev/core/lib/config/resolve';
 import { errorMessage } from '@e2e-dev/core/lib/internal/errors';
 import { discoverConfig, loadConfigModule } from '../config/load.ts';
 import { platformOpenCommand, spawnBrowserCommand } from '../internal/open-browser.ts';
@@ -36,31 +36,23 @@ export async function report(options: ReportOptions = {}): Promise<number> {
     return 2;
   }
 
-  let target: string;
+  let found: { readonly target: string; readonly filePath: string | undefined };
   try {
-    target = await resolveReportTarget(cwd, options);
+    found = await resolveReportFile(cwd, options);
   } catch (cause) {
     process.stderr.write(`${errorMessage(cause)}\n`);
     return 2;
   }
-
-  let filePath: string | undefined;
-  try {
-    filePath = await findReportFile(target);
-  } catch (cause) {
-    process.stderr.write(`${errorMessage(cause)}\n`);
-    return 2;
-  }
-  if (filePath === undefined) {
-    const shown = displayPath(cwd, target);
+  if (found.filePath === undefined) {
+    const shown = displayPath(cwd, found.target);
     process.stderr.write(
-      `no HTML report at ${shown}; add htmlReporter() from @e2e-dev/html-reporter to reporters in e2e.config.ts and run e2e run first\n`,
+      `no HTML report at ${shown}; pass its path to e2e report when htmlReporter({ outputFile }) writes elsewhere, or add htmlReporter() from @e2e-dev/html-reporter to reporters in e2e.config.ts and run e2e run first\n`,
     );
     return 2;
   }
 
-  const url = pathToFileURL(filePath).href;
-  process.stdout.write(`opening ${displayPath(cwd, filePath)} (${url})\n`);
+  const url = pathToFileURL(found.filePath).href;
+  process.stdout.write(`opening ${displayPath(cwd, found.filePath)} (${url})\n`);
   const open =
     options.open ??
     ((targetUrl: string) =>
@@ -71,30 +63,28 @@ export async function report(options: ReportOptions = {}): Promise<number> {
   return 0;
 }
 
-async function resolveReportTarget(cwd: string, options: ReportOptions): Promise<string> {
-  if (options.path !== undefined) return path.resolve(cwd, options.path);
-  const discovered = discoverConfig(cwd, options.config);
-  if (discovered.configPath === undefined) {
-    return path.resolve(cwd, options.output ?? '.e2e', REPORT_FILE);
+async function resolveReportFile(
+  cwd: string,
+  options: ReportOptions,
+): Promise<{ readonly target: string; readonly filePath: string | undefined }> {
+  let target: string;
+  if (options.path !== undefined) {
+    target = path.resolve(cwd, options.path);
+  } else {
+    const discovered = discoverConfig(cwd, options.config);
+    const rawOutput =
+      discovered.configPath === undefined
+        ? undefined
+        : (await loadConfigModule(discovered.configPath)).output;
+    target = path.join(resolveOutputDir(rawOutput, options.output, discovered.projectRoot), REPORT_FILE);
   }
-  const raw = await loadConfigModule(discovered.configPath);
-  const resolved = resolveProjectConfig(raw, {
-    projectRoot: discovered.projectRoot,
-    configPath: discovered.configPath,
-    env: process.env,
-    cli: options.output === undefined ? {} : { output: options.output },
-  });
-  return path.join(resolved.output, REPORT_FILE);
-}
-
-async function findReportFile(target: string): Promise<string | undefined> {
   const targetStats = await statOrUndefined(target);
-  if (targetStats === undefined) return undefined;
+  if (targetStats === undefined) return { target, filePath: undefined };
   const candidate = targetStats.isDirectory() ? path.join(target, REPORT_FILE) : target;
   const fileStats = candidate === target ? targetStats : await statOrUndefined(candidate);
-  if (fileStats?.isFile() !== true) return undefined;
+  if (fileStats?.isFile() !== true) return { target, filePath: undefined };
   await access(candidate, constants.R_OK);
-  return candidate;
+  return { target, filePath: candidate };
 }
 
 async function statOrUndefined(target: string) {
