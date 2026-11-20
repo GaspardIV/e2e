@@ -46,6 +46,14 @@ export interface StopDriverOptions {
   readonly sessionEnded?: boolean;
 }
 
+/** Error thrown when `leases.release` ran provider teardown and the cloud service rejected or warned on it. */
+export class ProviderReleaseWarningError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderReleaseWarningError';
+  }
+}
+
 /**
  * Releases `scope` on an already running daemon without starting or replacing
  * one, and returns whether the daemon confirmed it removed the lease record
@@ -63,7 +71,7 @@ export async function releaseLease(stateDir: string, scope: LeaseScopedOptions, 
   });
   const { released, provider } = await client.leases.release({ ...scope, signal });
   const warnings = releaseWarnings(provider);
-  if (warnings.length > 0) throw new Error(warnings.join('; '));
+  if (warnings.length > 0) throw new ProviderReleaseWarningError(warnings.join('; '));
   return released;
 }
 

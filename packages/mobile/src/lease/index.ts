@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { isAgentDeviceError, type LeaseScopedOptions } from 'agent-device';
 import type { DeviceClientConfig } from '../bindings.ts';
 import type { DeviceLease, DeviceReleaseContext, DeviceRequest } from '../provider.ts';
-import { releaseLease, startDriver, stopDriver } from './daemon.ts';
+import { ProviderReleaseWarningError, releaseLease, startDriver, stopDriver } from './daemon.ts';
 import { LEASE_TTL_MS, startHeartbeat } from './heartbeat.ts';
 
 export { agentDevicePlugin, type AgentDevicePlugin } from './plugin.ts';
@@ -55,11 +55,13 @@ export interface AgentDeviceLeases {
 
 const DEFAULT_RELEASE_BUDGET_MS = 30_000;
 const RELEASE_RPC_TIMEOUT_MS = 12_000;
+/** Reserve time `daemon stop` may need after a hung provider DELETE: graceful drain, then SIGTERM and SIGKILL. */
+const STOP_RESERVE_MS = 15_000;
 
 function releaseRpcBudgetMs(timeoutMs: number | undefined): number {
   const budget = timeoutMs ?? DEFAULT_RELEASE_BUDGET_MS;
-  if (Number.isNaN(budget) || budget <= 0) return 0;
-  return Math.min(RELEASE_RPC_TIMEOUT_MS, Math.floor(budget / 2));
+  if (Number.isNaN(budget)) return 0;
+  return Math.max(0, Math.min(RELEASE_RPC_TIMEOUT_MS, budget - STOP_RESERVE_MS));
 }
 
 type LeaseLifecycle =
@@ -80,8 +82,8 @@ interface Held {
 /**
  * Leases from `options.provider` for a `DeviceProvider`: one isolated
  * agent-device daemon per lease, allocated with `retainOnClose` so closing
- * the engine session keeps it, renewed while held, and stopped on release,
- * which ends the session at the service.
+ * the engine session keeps it, renewed while held, and ended via RPC on
+ * release before stopping the daemon (falling back to daemon stop).
  */
 export function agentDeviceLeases({ provider, label }: AgentDeviceLeaseOptions): AgentDeviceLeases {
   const held = new Map<string, Held>();
@@ -174,13 +176,15 @@ async function endLeaseDaemon(
   timeoutMs: number | undefined,
 ): Promise<void> {
   let releaseError: unknown;
+  let providerRejected = false;
   const { lifecycle } = resource;
-  if (lifecycle.stage === 'held') {
-    // Cap the RPC below the caller's cleanup budget so a hung provider DELETE never exhausts `signal` before `stopDriver` spawns.
+  const rpcBudgetMs = releaseRpcBudgetMs(timeoutMs);
+  if (lifecycle.stage === 'held' && rpcBudgetMs > 0) {
+    // Reserve STOP_RESERVE_MS for `stopDriver` so a hung provider DELETE never exhausts `signal` before `daemon stop` spawns and exits.
     const rpcTimeout = new AbortController();
     const timer = setTimeout(
       () => rpcTimeout.abort(new DOMException('Timed out waiting for lease RPC release', 'TimeoutError')),
-      releaseRpcBudgetMs(timeoutMs),
+      rpcBudgetMs,
     );
     timer.unref?.();
     const rpcSignal = AbortSignal.any([signal, rpcTimeout.signal]);
@@ -190,6 +194,7 @@ async function endLeaseDaemon(
       }
     } catch (error) {
       releaseError = error;
+      providerRejected = error instanceof ProviderReleaseWarningError;
     } finally {
       clearTimeout(timer);
     }
@@ -211,6 +216,8 @@ async function endLeaseDaemon(
     }
     throw stopError;
   }
+  // Warnings from `leases.release` mean agent-device already ran provider teardown and the service rejected it; daemon stop cannot retry it.
+  if (providerRejected) throw releaseError;
 }
 
 function messageOf(cause: unknown): string {

@@ -12,6 +12,7 @@ import { AppError, type LeaseScopedOptions } from 'agent-device';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DeviceReleaseContext, DeviceRequest } from '../../src/index.ts';
 import { agentDeviceLeases, type AgentDeviceLeaseRequest } from '../../src/lease/index.ts';
+import { ProviderReleaseWarningError } from '../../src/lease/daemon.ts';
 import type { DriverRequest } from '../../src/lease/driver.ts';
 
 const mocks = vi.hoisted(() => ({
@@ -296,27 +297,84 @@ describe('agentDeviceLeases()', () => {
       expect(stopSignalWhenExpired?.aborted).toBe(true);
 
       const shortLease = await provider.acquire(request({ slot: 2 }), allocation);
-      const shortBudget = new AbortController();
-      const shortTimer = setTimeout(() => shortBudget.abort(new Error('short cleanup budget exhausted')), 10_000);
-      let stopSignalOnShortBudget: AbortSignal | undefined;
+      const budget20s = new AbortController();
+      const budget20sTimer = setTimeout(() => budget20s.abort(new Error('20s cleanup budget exhausted')), 20_000);
+      let stopSignalOn20sBudget: AbortSignal | undefined;
       const shortReleaseCalled = new Promise<void>((resolve) => {
         mocks.releaseLease.mockImplementationOnce(hangUntilAborted(resolve));
       });
       mocks.stop.mockImplementationOnce(async (_stateDir, _env, _id, _label, signal) => {
-        stopSignalOnShortBudget = signal;
+        stopSignalOn20sBudget = signal;
       });
 
-      const pendingShort = provider.release(shortLease, { ...context, signal: shortBudget.signal, timeoutMs: 10_000 });
+      const pending20s = provider.release(shortLease, { ...context, signal: budget20s.signal, timeoutMs: 20_000 });
       await shortReleaseCalled;
+      // 20_000 ms minus the 15_000 ms stop reserve gives the RPC 5_000 ms.
       await vi.advanceTimersByTimeAsync(4_999);
       expect(mocks.stop).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(1);
       expect(mocks.stop).toHaveBeenCalledTimes(3);
-      await pendingShort;
-      clearTimeout(shortTimer);
+      await pending20s;
+      clearTimeout(budget20sTimer);
 
-      expect(stopSignalOnShortBudget).toBe(shortBudget.signal);
-      expect(stopSignalOnShortBudget?.aborted).toBe(false);
+      expect(stopSignalOn20sBudget).toBe(budget20s.signal);
+      expect(stopSignalOn20sBudget?.aborted).toBe(false);
+
+      // Budgets at or below the 15_000 ms stop reserve skip the RPC so daemon stop keeps the full budget.
+      for (const [slot, budgetMs] of [[3, 10_000], [4, 5_000], [5, Number.NaN]] as const) {
+        const callsBefore = mocks.releaseLease.mock.calls.length;
+        const stopsBefore = mocks.stop.mock.calls.length;
+        const callIndex = mocks.start.mock.calls.length;
+        const skippedLease = await provider.acquire(request({ slot }), allocation);
+        const outerSignal = new AbortController().signal;
+        await provider.release(skippedLease, { ...context, signal: outerSignal, timeoutMs: budgetMs });
+        expect(mocks.releaseLease).toHaveBeenCalledTimes(callsBefore);
+        expect(mocks.stop).toHaveBeenCalledTimes(stopsBefore + 1);
+        expect(mocks.stop).toHaveBeenLastCalledWith(
+          driver(callIndex).stateDir,
+          driverEnv(callIndex),
+          skippedLease.id,
+          'Cloud',
+          outerSignal,
+          { sessionEnded: false },
+        );
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('gives a slow POSIX daemon stop (9 s / 10.5 s) enough budget under 10 s and 20 s cleanup timeouts', async () => {
+    vi.useFakeTimers();
+    try {
+      const provider = leases();
+      for (const [slot, budgetMs, stopDurationMs] of [[0, 10_000, 9_000], [1, 20_000, 10_500]] as const) {
+        const leaseForSlowStop = await provider.acquire(request({ slot }), allocation);
+        const budgetController = new AbortController();
+        const budgetTimer = setTimeout(() => budgetController.abort(new Error('cleanup budget exhausted')), budgetMs);
+        let daemonExited = false;
+        if (budgetMs > 15_000) mocks.releaseLease.mockImplementationOnce(hangUntilAborted(() => {}));
+        mocks.stop.mockImplementationOnce((_stateDir, _env, _id, _label, signal) =>
+          new Promise<void>((resolve, reject) => {
+            if (signal.aborted) {
+              reject(signal.reason);
+              return;
+            }
+            const timer = setTimeout(() => {
+              daemonExited = true;
+              resolve();
+            }, stopDurationMs);
+            signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              reject(signal.reason);
+            }, { once: true });
+          }));
+        const pendingSlowStop = provider.release(leaseForSlowStop, { ...context, signal: budgetController.signal, timeoutMs: budgetMs });
+        await vi.advanceTimersByTimeAsync(budgetMs - 1);
+        expect(daemonExited).toBe(true);
+        await pendingSlowStop;
+        clearTimeout(budgetTimer);
+      }
     } finally {
       vi.useRealTimers();
     }
@@ -351,7 +409,7 @@ describe('agentDeviceLeases()', () => {
     expect(existsSync(dir)).toBe(true);
   });
 
-  it('falls back to daemon stop confirmation when RPC lease release returns false or fails, and combines both errors when both fail', async () => {
+  it('falls back to daemon stop confirmation on non-warning RPC errors or false, and combines both errors when stop fails', async () => {
     const provider = leases();
     const first = await provider.acquire(request(), allocation);
     mocks.releaseLease.mockResolvedValueOnce(false);
@@ -359,14 +417,14 @@ describe('agentDeviceLeases()', () => {
     expect(mocks.stop).toHaveBeenLastCalledWith(driver(0).stateDir, driverEnv(0), 'lease-1', 'Cloud', context.signal, { sessionEnded: false });
 
     const second = await provider.acquire(request({ slot: 1 }), allocation);
-    mocks.releaseLease.mockRejectedValueOnce(new Error('DELETE /session returned 500'));
+    mocks.releaseLease.mockRejectedValueOnce(new Error('socket hang up'));
     await provider.release(second, context);
     expect(mocks.stop).toHaveBeenLastCalledWith(driver(1).stateDir, driverEnv(1), 'lease-2', 'Cloud', context.signal, { sessionEnded: false });
 
     const third = await provider.acquire(request({ slot: 2 }), allocation);
-    mocks.releaseLease.mockRejectedValueOnce(new Error('DELETE /session returned 500'));
+    mocks.releaseLease.mockRejectedValueOnce(new DOMException('Timed out waiting for lease RPC release', 'TimeoutError'));
     mocks.stop.mockRejectedValueOnce(new Error('graceful shutdown report unavailable'));
-    await expect(provider.release(third, context)).rejects.toThrow('Cloud lease release failed: DELETE /session returned 500; graceful shutdown report unavailable');
+    await expect(provider.release(third, context)).rejects.toThrow('Cloud lease release failed: Timed out waiting for lease RPC release; graceful shutdown report unavailable');
 
     mocks.releaseLease.mockRejectedValueOnce(new AppError('COMMAND_FAILED', 'No daemon is running.', { reason: 'daemon-not-running' }));
     mocks.stop.mockRejectedValueOnce(new Error('agent-device found no daemon running for lease lease-3'));
@@ -379,6 +437,22 @@ describe('agentDeviceLeases()', () => {
     expect(daemonNotRunningError).toBeInstanceOf(Error);
     expect(daemonNotRunningError).not.toBeInstanceOf(AggregateError);
     expect((daemonNotRunningError as Error).message).toBe('agent-device found no daemon running for lease lease-3');
+  });
+
+  it('always fails on provider warning rejections even when daemon stop resolves, and aggregates with stop failures', async () => {
+    const provider = leases();
+    const first = await provider.acquire(request(), allocation);
+    mocks.releaseLease.mockRejectedValueOnce(new ProviderReleaseWarningError('WEBDRIVER_SESSION_DELETE_FAILED: DELETE /session returned 500'));
+    await expect(provider.release(first, context)).rejects.toThrow('WEBDRIVER_SESSION_DELETE_FAILED: DELETE /session returned 500');
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+    expect(mocks.stop).toHaveBeenLastCalledWith(driver(0).stateDir, driverEnv(0), 'lease-1', 'Cloud', context.signal, { sessionEnded: false });
+
+    const second = await provider.acquire(request({ slot: 1 }), allocation);
+    mocks.releaseLease.mockRejectedValueOnce(new ProviderReleaseWarningError('WEBDRIVER_SESSION_DELETE_FAILED: DELETE /session returned 500'));
+    mocks.stop.mockRejectedValueOnce(new Error('graceful shutdown report unavailable'));
+    await expect(provider.release(second, context)).rejects.toThrow(
+      'Cloud lease release failed: WEBDRIVER_SESSION_DELETE_FAILED: DELETE /session returned 500; graceful shutdown report unavailable',
+    );
   });
 
   it('cleans up without stopping again when the stop confirmed the session ended but the cleanup failed', async () => {

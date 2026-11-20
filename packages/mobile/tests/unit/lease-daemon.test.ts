@@ -1,11 +1,14 @@
 /** Against the installed agent-device: the daemon stop a lease's release relies on, and the report it checks. */
 
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAgentDeviceClient, isAgentDeviceError } from 'agent-device';
 import { afterAll, expect, it, vi } from 'vitest';
-import { assertSessionsEnded, releaseLease, stopDriver } from '../../src/lease/daemon.ts';
+import { assertSessionsEnded, ProviderReleaseWarningError, releaseLease, stopDriver } from '../../src/lease/daemon.ts';
+import { agentDeviceLeases } from '../../src/lease/index.ts';
 
 vi.mock('agent-device', async (original) => {
   const actual = await original<typeof import('agent-device')>();
@@ -98,7 +101,159 @@ it('rejects when leases.release reports provider cleanup warnings even if releas
       }),
     },
   });
-  await expect(
-    releaseLease(path.join(dir, 'warn-state'), { leaseId: 'lease-1', tenant: 'browserstack', runId: 'run-1', leaseBackend: 'ios-instance', leaseProvider: 'browserstack' }, AbortSignal.timeout(10_000)),
-  ).rejects.toThrow('WEBDRIVER_SESSION_DELETE_FAILED: HTTP 500 on DELETE /session/wd-1');
+  let warningError: unknown;
+  try {
+    await releaseLease(path.join(dir, 'warn-state'), { leaseId: 'lease-1', tenant: 'browserstack', runId: 'run-1', leaseBackend: 'ios-instance', leaseProvider: 'browserstack' }, AbortSignal.timeout(10_000));
+  } catch (error) {
+    warningError = error;
+  }
+  expect(warningError).toBeInstanceOf(ProviderReleaseWarningError);
+  expect((warningError as Error).message).toBe('WEBDRIVER_SESSION_DELETE_FAILED: HTTP 500 on DELETE /session/wd-1');
+});
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function waitForDaemonExit(pid: number, timeoutMs = 1_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isPidAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return true;
+}
+
+async function withMockWebDriver(
+  onDelete: (reply: (status: number, body: unknown) => void) => void,
+  run: (endpoint: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer((req, res) => {
+    req.resume();
+    if (req.method === 'POST' && req.url?.endsWith('/session')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ value: { sessionId: 'wd-short-1', capabilities: {} } }));
+      return;
+    }
+    if (req.method === 'DELETE' && req.url?.includes('/session/')) {
+      onDelete((status, body) => {
+        if (res.writableEnded || res.destroyed) return;
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(body));
+      });
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const { port } = server.address() as AddressInfo;
+  try {
+    await run(`http://127.0.0.1:${port}/wd/hub`);
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+async function withRealMockLease(
+  runId: string,
+  onDelete: (reply: (status: number, body: unknown) => void) => void,
+  fn: (ctx: {
+    leases: ReturnType<typeof agentDeviceLeases>;
+    lease: Awaited<ReturnType<ReturnType<typeof agentDeviceLeases>['acquire']>>;
+    env: NodeJS.ProcessEnv;
+    pid: number;
+  }) => Promise<void>,
+): Promise<void> {
+  let pid: number | undefined;
+  let leaseDir: string | undefined;
+  const leases = agentDeviceLeases({ provider: 'browserstack', label: 'BrowserStack' });
+  try {
+    await withMockWebDriver(onDelete, async (endpoint) => {
+      const env = { ...process.env, BROWSERSTACK_USERNAME: 'u', BROWSERSTACK_ACCESS_KEY: 'k', BROWSERSTACK_WEBDRIVER_ENDPOINT: endpoint };
+      const lease = await leases.acquire({
+        platform: 'android',
+        runId,
+        targetName: 'android',
+        slot: 0,
+        slots: 1,
+        agentDeviceVersion: '0.21.38',
+        projectRoot: dir,
+        env,
+        signal: AbortSignal.timeout(20_000),
+        log: () => undefined,
+      }, {
+        env: {},
+        selectors: { device: 'Pixel 9', providerOsVersion: '15.0', providerApp: 'bs://app' },
+        summary: 'Pixel 9, android 15.0',
+      });
+      const stateDir = lease.client!['stateDir'] as string;
+      leaseDir = path.dirname(stateDir);
+      pid = (JSON.parse(readFileSync(path.join(stateDir, 'daemon.json'), 'utf8')) as { pid: number }).pid;
+      expect(isPidAlive(pid)).toBe(true);
+      await fn({ leases, lease, env, pid });
+    });
+  } finally {
+    if (pid !== undefined && isPidAlive(pid)) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {}
+    }
+    if (leaseDir !== undefined) rmSync(leaseDir, { recursive: true, force: true });
+  }
+}
+
+it('stops the real daemon process within a 5 s budget when DELETE takes 1.5 s (passing on POSIX, unconfirmed-stop on Windows)', async () => {
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  try {
+    await withRealMockLease(
+      'short-ok',
+      (reply) => {
+        const timer = setTimeout(() => reply(200, { value: null }), 1_500);
+        timer.unref?.();
+        timers.push(timer);
+      },
+      async ({ leases, lease, env, pid }) => {
+        const releasePromise = leases.release(lease, { runId: 'short-ok', targetName: 'android', env, signal: AbortSignal.timeout(5_000), timeoutMs: 5_000, log: () => undefined });
+        if (process.platform === 'win32') {
+          // Budgets <= STOP_RESERVE_MS skip the RPC and fall back to daemon stop, whose Win32 SIGTERM leaves no shutdown report in agent-device@0.21.38.
+          await expect(releasePromise).rejects.toThrow('could not confirm its BrowserStack sessions ended');
+        } else {
+          await expect(releasePromise).resolves.toBeUndefined();
+        }
+        expect(await waitForDaemonExit(pid)).toBe(true);
+      },
+    );
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+  }
+});
+
+it('stops the real daemon process under a 12 s budget when DELETE /session hangs instead of leaking it', async () => {
+  await withRealMockLease(
+    'short-hang',
+    () => {
+      // Intentionally never respond so daemon stop hits its provider teardown timeout and escalates/kills cleanly.
+    },
+    async ({ leases, lease, env, pid }) => {
+      await expect(leases.release(lease, { runId: 'short-hang', targetName: 'android', env, signal: AbortSignal.timeout(12_000), timeoutMs: 12_000, log: () => undefined })).rejects.toThrow();
+      expect(await waitForDaemonExit(pid)).toBe(true);
+    },
+  );
+});
+
+it('fails release and stops the real daemon when DELETE /session returns HTTP 500', async () => {
+  await withRealMockLease(
+    'rpc-500',
+    (reply) => reply(500, { value: { error: 'unknown error', message: 'provider failed' } }),
+    async ({ leases, lease, env, pid }) => {
+      await expect(leases.release(lease, { runId: 'rpc-500', targetName: 'android', env, signal: AbortSignal.timeout(30_000), timeoutMs: 30_000, log: () => undefined })).rejects.toThrow('WEBDRIVER_SESSION_DELETE_FAILED');
+      expect(await waitForDaemonExit(pid)).toBe(true);
+    },
+  );
 });
