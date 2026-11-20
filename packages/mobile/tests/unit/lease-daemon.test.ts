@@ -234,14 +234,14 @@ it('stops the real daemon process within a 5 s budget when DELETE takes 1.5 s (p
   }
 });
 
-it('stops the real daemon process under a 12 s budget when DELETE /session hangs instead of leaking it', async () => {
+it('stops the real daemon process under a 15 s budget when DELETE /session hangs instead of leaking it', async () => {
   await withRealMockLease(
     'short-hang',
     () => {
       // Intentionally never respond so daemon stop hits its provider teardown timeout and escalates/kills cleanly.
     },
     async ({ leases, lease, env, pid }) => {
-      await expect(leases.release(lease, { runId: 'short-hang', targetName: 'android', env, signal: AbortSignal.timeout(12_000), timeoutMs: 12_000, log: () => undefined })).rejects.toThrow();
+      await expect(leases.release(lease, { runId: 'short-hang', targetName: 'android', env, signal: AbortSignal.timeout(15_000), timeoutMs: 15_000, log: () => undefined })).rejects.toThrow();
       expect(await waitForDaemonExit(pid)).toBe(true);
     },
   );

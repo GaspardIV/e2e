@@ -60,7 +60,6 @@ const STOP_RESERVE_MS = 15_000;
 
 function releaseRpcBudgetMs(timeoutMs: number | undefined): number {
   const budget = timeoutMs ?? DEFAULT_RELEASE_BUDGET_MS;
-  if (Number.isNaN(budget)) return 0;
   return Math.max(0, Math.min(RELEASE_RPC_TIMEOUT_MS, budget - STOP_RESERVE_MS));
 }
 
@@ -176,7 +175,6 @@ async function endLeaseDaemon(
   timeoutMs: number | undefined,
 ): Promise<void> {
   let releaseError: unknown;
-  let providerRejected = false;
   const { lifecycle } = resource;
   const rpcBudgetMs = releaseRpcBudgetMs(timeoutMs);
   if (lifecycle.stage === 'held' && rpcBudgetMs > 0) {
@@ -194,7 +192,6 @@ async function endLeaseDaemon(
       }
     } catch (error) {
       releaseError = error;
-      providerRejected = error instanceof ProviderReleaseWarningError;
     } finally {
       clearTimeout(timer);
     }
@@ -217,7 +214,7 @@ async function endLeaseDaemon(
     throw stopError;
   }
   // Warnings from `leases.release` mean agent-device already ran provider teardown and the service rejected it; daemon stop cannot retry it.
-  if (providerRejected) throw releaseError;
+  if (releaseError instanceof ProviderReleaseWarningError) throw releaseError;
 }
 
 function messageOf(cause: unknown): string {
