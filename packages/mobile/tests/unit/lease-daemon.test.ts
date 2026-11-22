@@ -221,7 +221,7 @@ it('stops the real daemon process within a 5 s budget when DELETE takes 1.5 s (p
       async ({ leases, lease, env, pid }) => {
         const releasePromise = leases.release(lease, { runId: 'short-ok', targetName: 'android', env, signal: AbortSignal.timeout(5_000), timeoutMs: 5_000, log: () => undefined });
         if (process.platform === 'win32') {
-          // Budgets <= STOP_RESERVE_MS skip the RPC and fall back to daemon stop, whose Win32 SIGTERM leaves no shutdown report in agent-device@0.21.38.
+          // Budgets below STOP_RESERVE_MS + MIN_RELEASE_RPC_MS (20 s) skip the RPC and fall back to daemon stop, whose Win32 SIGTERM leaves no shutdown report in agent-device@0.21.38.
           await expect(releasePromise).rejects.toThrow('could not confirm its BrowserStack sessions ended');
         } else {
           await expect(releasePromise).resolves.toBeUndefined();
@@ -234,18 +234,44 @@ it('stops the real daemon process within a 5 s budget when DELETE takes 1.5 s (p
   }
 });
 
-it('stops the real daemon process under a 15 s budget when DELETE /session hangs instead of leaking it', async () => {
+it('stops the real daemon process under a 16 s budget when DELETE takes 1.5 s instead of cancelling mid-flight', async () => {
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  try {
+    await withRealMockLease(
+      'short-16s-ok',
+      (reply) => {
+        const timer = setTimeout(() => reply(200, { value: null }), 1_500);
+        timer.unref?.();
+        timers.push(timer);
+      },
+      async ({ leases, lease, env, pid }) => {
+        const releasePromise = leases.release(lease, { runId: 'short-16s-ok', targetName: 'android', env, signal: AbortSignal.timeout(16_000), timeoutMs: 16_000, log: () => undefined });
+        if (process.platform === 'win32') {
+          // Budgets below STOP_RESERVE_MS + MIN_RELEASE_RPC_MS (20 s) skip the RPC and fall back to daemon stop.
+          await expect(releasePromise).rejects.toThrow('could not confirm its BrowserStack sessions ended');
+        } else {
+          await expect(releasePromise).resolves.toBeUndefined();
+        }
+        expect(await waitForDaemonExit(pid)).toBe(true);
+      },
+    );
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+  }
+});
+
+it('caps the RPC after 12 s and stops the real daemon process under a 30 s budget when DELETE /session hangs', async () => {
   await withRealMockLease(
-    'short-hang',
+    'hung-30s',
     () => {
-      // Intentionally never respond so daemon stop hits its provider teardown timeout and escalates/kills cleanly.
+      // Intentionally never respond so the 12 s RPC cap fires and daemon stop still has STOP_RESERVE_MS to shut down cleanly.
     },
     async ({ leases, lease, env, pid }) => {
-      await expect(leases.release(lease, { runId: 'short-hang', targetName: 'android', env, signal: AbortSignal.timeout(15_000), timeoutMs: 15_000, log: () => undefined })).rejects.toThrow();
+      await expect(leases.release(lease, { runId: 'hung-30s', targetName: 'android', env, signal: AbortSignal.timeout(30_000), timeoutMs: 30_000, log: () => undefined })).rejects.toThrow('Timed out after 12000 ms waiting for lease RPC release');
       expect(await waitForDaemonExit(pid)).toBe(true);
     },
   );
-});
+}, 40_000);
 
 it('fails release and stops the real daemon when DELETE /session returns HTTP 500', async () => {
   await withRealMockLease(

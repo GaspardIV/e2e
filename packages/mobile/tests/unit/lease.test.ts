@@ -67,7 +67,7 @@ function request(overrides: Partial<DeviceRequest> = {}): DeviceRequest {
   };
 }
 
-const context: DeviceReleaseContext = { runId: 'run-1', targetName: 'android', env, signal: new AbortController().signal, log: () => undefined };
+const context: DeviceReleaseContext = { runId: 'run-1', targetName: 'android', env, signal: new AbortController().signal, timeoutMs: 30_000, log: () => undefined };
 
 const driver = (call = 0) => mocks.start.mock.calls[call]![0] as DriverRequest;
 const driverEnv = (call = 0) => mocks.start.mock.calls[call]![1] as NodeJS.ProcessEnv;
@@ -320,8 +320,22 @@ describe('agentDeviceLeases()', () => {
       expect(stopSignalOn20sBudget).toBe(budget20s.signal);
       expect(stopSignalOn20sBudget?.aborted).toBe(false);
 
-      // Budgets at or below the 15_000 ms stop reserve skip the RPC so daemon stop keeps the full budget.
-      for (const [slot, budgetMs] of [[3, 10_000], [4, 5_000], [5, Number.NaN]] as const) {
+      // When rpcTimeout hits its 12 s cap and agent-device rejects with generic `request canceled`, report the timeout duration instead.
+      const cappedLease = await provider.acquire(request({ slot: 9 }), allocation);
+      mocks.releaseLease.mockImplementationOnce((_stateDir, _scope, signal) =>
+        new Promise<boolean>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('request canceled')), { once: true });
+        }));
+      mocks.stop.mockRejectedValueOnce(new Error('graceful shutdown report unavailable'));
+      const cappedPending = provider.release(cappedLease, context);
+      const cappedAssertion = expect(cappedPending).rejects.toThrow(
+        'Cloud lease release failed: Timed out after 12000 ms waiting for lease RPC release; graceful shutdown report unavailable',
+      );
+      await vi.advanceTimersByTimeAsync(12_000);
+      await cappedAssertion;
+
+      // Budgets with less than MIN_RELEASE_RPC_MS above the 15_000 ms stop reserve (or omitted timeoutMs / NaN) skip the RPC.
+      for (const [slot, budgetMs] of [[3, 19_999], [4, 16_000], [5, 10_000], [6, 5_000], [7, Number.NaN], [8, undefined]] as const) {
         const callsBefore = mocks.releaseLease.mock.calls.length;
         const stopsBefore = mocks.stop.mock.calls.length;
         const callIndex = mocks.start.mock.calls.length;

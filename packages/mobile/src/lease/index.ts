@@ -55,12 +55,15 @@ export interface AgentDeviceLeases {
 
 const DEFAULT_RELEASE_BUDGET_MS = 30_000;
 const RELEASE_RPC_TIMEOUT_MS = 12_000;
+/** Skip the RPC when less than this remains, because a cancelled RPC can delete the daemon's lease record just before `daemon stop` inspects it. */
+const MIN_RELEASE_RPC_MS = 5_000;
 /** Reserve time `daemon stop` may need after a hung provider DELETE: graceful drain, then SIGTERM and SIGKILL. */
 const STOP_RESERVE_MS = 15_000;
 
 function releaseRpcBudgetMs(timeoutMs: number | undefined): number {
-  const budget = timeoutMs ?? DEFAULT_RELEASE_BUDGET_MS;
-  return Math.max(0, Math.min(RELEASE_RPC_TIMEOUT_MS, budget - STOP_RESERVE_MS));
+  if (timeoutMs === undefined) return 0;
+  const rpc = Math.min(RELEASE_RPC_TIMEOUT_MS, timeoutMs - STOP_RESERVE_MS);
+  return rpc >= MIN_RELEASE_RPC_MS ? rpc : 0;
 }
 
 type LeaseLifecycle =
@@ -191,7 +194,9 @@ async function endLeaseDaemon(
         lifecycle.stage = 'session-ended';
       }
     } catch (error) {
-      releaseError = error;
+      releaseError = rpcTimeout.signal.aborted
+        ? new Error(`Timed out after ${rpcBudgetMs} ms waiting for lease RPC release`, { cause: error })
+        : error;
     } finally {
       clearTimeout(timer);
     }
