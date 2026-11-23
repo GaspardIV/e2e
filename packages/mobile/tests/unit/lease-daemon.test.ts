@@ -175,7 +175,7 @@ async function withRealMockLease(
   const leases = agentDeviceLeases({ provider: 'browserstack', label: 'BrowserStack' });
   try {
     await withMockWebDriver(onDelete, async (endpoint) => {
-      const env = { ...process.env, BROWSERSTACK_USERNAME: 'u', BROWSERSTACK_ACCESS_KEY: 'k', BROWSERSTACK_WEBDRIVER_ENDPOINT: endpoint };
+      const env = { ...process.env, BROWSERSTACK_USERNAME: 'u', BROWSERSTACK_ACCESS_KEY: 'k', BROWSERSTACK_WEBDRIVER_ENDPOINT: endpoint, BROWSERSTACK_SESSION_DETAILS_ENDPOINT: endpoint };
       const lease = await leases.acquire({
         platform: 'android',
         runId,
@@ -259,6 +259,26 @@ it('stops the real daemon process under a 16 s budget when DELETE takes 1.5 s in
     for (const timer of timers) clearTimeout(timer);
   }
 });
+
+it('releases a slow 4 s DELETE 200 via RPC under a 30 s budget and stops the real daemon cleanly', async () => {
+  const timers: ReturnType<typeof setTimeout>[] = [];
+  try {
+    await withRealMockLease(
+      'rpc-30s-ok',
+      (reply) => {
+        const timer = setTimeout(() => reply(200, { value: null }), 4_000);
+        timer.unref?.();
+        timers.push(timer);
+      },
+      async ({ leases, lease, env, pid }) => {
+        await expect(leases.release(lease, { runId: 'rpc-30s-ok', targetName: 'android', env, signal: AbortSignal.timeout(30_000), timeoutMs: 30_000, log: () => undefined })).resolves.toBeUndefined();
+        expect(await waitForDaemonExit(pid)).toBe(true);
+      },
+    );
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+  }
+}, 40_000);
 
 it('caps the RPC after 12 s and stops the real daemon process under a 30 s budget when DELETE /session hangs', async () => {
   await withRealMockLease(

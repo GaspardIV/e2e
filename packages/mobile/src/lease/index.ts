@@ -62,7 +62,11 @@ const STOP_RESERVE_MS = 15_000;
 
 function releaseRpcBudgetMs(timeoutMs: number | undefined): number {
   if (timeoutMs === undefined) return 0;
-  const rpc = Math.min(RELEASE_RPC_TIMEOUT_MS, timeoutMs - STOP_RESERVE_MS);
+  // Above 30 s, keep the 18 s (DEFAULT_RELEASE_BUDGET_MS - RELEASE_RPC_TIMEOUT_MS) stop reserve and give the rest to slow provider DELETEs.
+  const rpc = Math.max(
+    Math.min(RELEASE_RPC_TIMEOUT_MS, timeoutMs - STOP_RESERVE_MS),
+    timeoutMs - (DEFAULT_RELEASE_BUDGET_MS - RELEASE_RPC_TIMEOUT_MS),
+  );
   return rpc >= MIN_RELEASE_RPC_MS ? rpc : 0;
 }
 

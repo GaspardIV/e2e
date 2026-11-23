@@ -334,6 +334,20 @@ describe('agentDeviceLeases()', () => {
       await vi.advanceTimersByTimeAsync(12_000);
       await cappedAssertion;
 
+      // Above 30 s, retain the 18 s stop reserve and grant the remaining budget (e.g. 42 s at 60 s) to the RPC.
+      const largeBudgetLease = await provider.acquire(request({ slot: 10 }), allocation);
+      const largeBudgetController = new AbortController();
+      const largeBudgetCalled = new Promise<void>((resolve) => {
+        mocks.releaseLease.mockImplementationOnce(hangUntilAborted(resolve));
+      });
+      const pending60s = provider.release(largeBudgetLease, { ...context, signal: largeBudgetController.signal, timeoutMs: 60_000 });
+      await largeBudgetCalled;
+      await vi.advanceTimersByTimeAsync(41_999);
+      expect(mocks.stop).toHaveBeenCalledTimes(4);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(mocks.stop).toHaveBeenCalledTimes(5);
+      await pending60s;
+
       // Budgets with less than MIN_RELEASE_RPC_MS above the 15_000 ms stop reserve (or omitted timeoutMs / NaN) skip the RPC.
       for (const [slot, budgetMs] of [[3, 19_999], [4, 16_000], [5, 10_000], [6, 5_000], [7, Number.NaN], [8, undefined]] as const) {
         const callsBefore = mocks.releaseLease.mock.calls.length;
