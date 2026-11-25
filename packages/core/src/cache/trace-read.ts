@@ -368,7 +368,7 @@ function readDescriptor(document: unknown): TraceTargetDescriptor | undefined {
     return undefined;
   }
   const raw = document as Record<string, unknown>;
-  const descriptor: Record<string, string | TracePosition | readonly TraceAnchorState[]> = {};
+  const descriptor: Record<string, string | true | TracePosition | readonly TraceAnchorState[]> = {};
   for (const field of DESCRIPTOR_FIELDS) {
     const value = raw[field];
     if (value === undefined) continue;
@@ -380,6 +380,14 @@ function readDescriptor(document: unknown): TraceTargetDescriptor | undefined {
     const position = readPosition(raw['position']);
     if (position === undefined) return undefined;
     descriptor['position'] = position;
+  }
+  if (raw['twinsWithoutTestId'] !== undefined) {
+    if (raw['twinsWithoutTestId'] !== true || descriptor['testId'] === undefined) return undefined;
+    descriptor['twinsWithoutTestId'] = true;
+  }
+  if (raw['countedOnEarlierLook'] !== undefined) {
+    if (raw['countedOnEarlierLook'] !== true || (descriptor['position'] === undefined && descriptor['twinsWithoutTestId'] === undefined)) return undefined;
+    descriptor['countedOnEarlierLook'] = true;
   }
   if (raw['states'] !== undefined) {
     const states = readStates(raw['states']);
@@ -408,6 +416,11 @@ function readPosition(document: unknown): TracePosition | undefined {
   return { index: index as number, of: of as number };
 }
 
+/** Whether a provenance field that may be absent is absent or a SHA-256 hex digest. */
+function isOptionalDigest(value: unknown): value is string | undefined {
+  return value === undefined || (typeof value === 'string' && SHA256_HEX.test(value));
+}
+
 function readProvenance(document: unknown): TraceProvenance | undefined {
   if (typeof document !== 'object' || document === null || Array.isArray(document)) {
     return undefined;
@@ -419,13 +432,15 @@ function readProvenance(document: unknown): TraceProvenance | undefined {
   if (testId === undefined || targetId === undefined) return undefined;
   if (typeof instructionDigest !== 'string' || !SHA256_HEX.test(instructionDigest)) return undefined;
   const paramsDigest = raw['paramsDigest'];
-  if (paramsDigest !== undefined && (typeof paramsDigest !== 'string' || !SHA256_HEX.test(paramsDigest))) return undefined;
+  if (!isOptionalDigest(paramsDigest)) return undefined;
   const callIndex = raw['callIndex'];
   if (callIndex !== undefined && (typeof callIndex !== 'number' || !Number.isSafeInteger(callIndex) || callIndex < 0)) {
     return undefined;
   }
   const agent = raw['agent'] === undefined ? undefined : readBoundedText(raw['agent'], MAX_TRACE_DESCRIPTOR_CHARS);
   if (raw['agent'] !== undefined && agent === undefined) return undefined;
+  const identityDigest = raw['identityDigest'];
+  if (!isOptionalDigest(identityDigest)) return undefined;
   return {
     testId,
     targetId,
@@ -433,6 +448,7 @@ function readProvenance(document: unknown): TraceProvenance | undefined {
     ...(paramsDigest === undefined ? {} : { paramsDigest }),
     ...(callIndex === undefined ? {} : { callIndex }),
     ...(agent === undefined ? {} : { agent }),
+    ...(identityDigest === undefined ? {} : { identityDigest }),
   };
 }
 

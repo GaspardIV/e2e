@@ -25,7 +25,7 @@ test('the dashboard loads', async ({ app, screen, browser }) => {
 });
 ```
 
-In a suite with device targets, add `{ requires: ['browser'] }` to a test
+In a suite with device targets, add `{ platforms: ['web'] }` to a test
 that uses `browser`, so the runner skips it on devices.
 
 ## Mock an API
@@ -171,6 +171,22 @@ await app.open('/');
 A value holds for the rest of the test, through `app.restart()` and
 `app.clearState()`. See [media emulation](/reference/web#media-emulation).
 
+## Go offline
+
+`browser.setNetwork('offline')` cuts the network for every tab and service
+worker, until the test ends or goes back online:
+
+```ts
+await app.open('/');
+await browser.setNetwork('offline');
+await screen.getByRole('button', 'Refresh').tap();
+await expect(screen.getByText('You are offline')).toBeVisible();
+```
+
+`browser.reload()` loads a page its service worker cached. A navigation to a
+page no cache holds fails with `ACTION_FAILED`. See
+[`setNetwork`](/reference/web#setnetwork).
+
 ## Cookies
 
 ```ts
@@ -223,6 +239,7 @@ when the run no longer uses it.
 | Service | Provider |
 | --- | --- |
 | [Kernel](/integrations/kernel) | `kernel()` from `@e2e-dev/kernel` |
+| [Notte](/integrations/notte) | `notte()` from `@e2e-dev/notte` |
 | [smol machines](/integrations/smol) microVMs on your own computer | `smol()` from `@e2e-dev/smol` |
 | [Lightpanda](/integrations/lightpanda), the open-source headless browser, on your own machine | `lightpanda()` from `@e2e-dev/lightpanda` |
 | [Moli](/integrations/moli), a local browser with on-demand layout and screenshots | `moli()` from `@e2e-dev/moli` |
@@ -405,8 +422,8 @@ tab, so the remote browser must contain only that context. The limits of
 [`connect.reconnectEndpoint`](/reference/web#recovering-a-cdp-transport)
 apply:
 
-- No `headers`, `basicAuth`, `userAgent`, `locale`, or `timezoneId`. Each
-  is `INVALID_CONFIG`.
+- No `headers`, `basicAuth`, `userAgent`, `locale`, `timezoneId`, or
+  `deviceScaleFactor`. Each is `INVALID_CONFIG`.
 - No `app.clearState()`. It is `UNSUPPORTED_CAPABILITY`, naming the scope.
 - No session state capture or restore. A run whose tests use a
   [session](/authentication) on the target fails with `COLLECTION_ERROR`
@@ -425,7 +442,9 @@ runner can't open it. With `downloads`, it saves the file under `dir`, and
 the engine passes the finished file's path to `read`. `read` fetches the
 bytes through the service's file API, in the worker, bounded by the call's
 timeout. [Kernel](/integrations/kernel#downloads) serves downloads this
-way.
+way. A service that stores downloads by name rather than by path finds the
+file by `context.suggestedFilename`, the name the site suggested, as
+[Notte](/integrations/notte#downloads) does.
 
 Without `downloads`, a download on a browser on another machine fails with
 `ENGINE_FAILURE`, naming the provider. A provider whose browsers run on the

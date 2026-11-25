@@ -12,6 +12,7 @@
  * | target_still_moving with `details.dispatched: no`            | NODE_STALE (retryable)        |
  * | a covered or keyboard-occluded target, `dispatched: no`      | NOT_ACTIONABLE, with the hint |
  * | a target with no screen origin to aim at, `dispatched: no`   | NOT_ACTIONABLE, with the hint |
+ * | screen.swipe({ from, to }) off agent-device's viewport       | NOT_ACTIONABLE, with the hint |
  * | the iOS runner busy, wedged, or past its watchdog           | ENGINE_FAILURE, naming the   |
  * | a snapshot the iOS runner acquired but could not present    |   runner and the recovery    |
  * | anything else, agent-device's own timeouts included         | ENGINE_FAILURE with the text |
@@ -28,7 +29,7 @@
 
 import { isAgentDeviceError, normalizeAgentDeviceError } from 'agent-device';
 import { defaultHintForCode } from 'agent-device/contracts';
-import { EngineError, ConfigurationError, InfrastructureError, TestError, raceAbort } from '@e2e-dev/core/engine';
+import { EngineError, ConfigurationError, InfrastructureError, TestError, raceAbort, type ViewportSize } from '@e2e-dev/core/engine';
 import { cancelled } from './support.ts';
 
 /**
@@ -95,6 +96,19 @@ const STALE_REF_REASONS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * The snapshot warning agent-device 0.21.37 adds, word for word, when a
+ * capture could not place its window on the screen. It refuses its own ref
+ * actions on that capture with `window-origin-unknown`, but takes points a
+ * caller sends, so a gesture aimed from the capture's rects is checked here.
+ */
+export const ORIGIN_WARNING =
+  'This snapshot cannot establish the window origin on screen. Coordinate-derived element interactions are unavailable until a capture measures the viewport.';
+
+/** What that capture means for a caller, after "The " or "the ": the one wording a refused tap and a refused node swipe share. */
+export const ORIGIN_UNKNOWN_BOUNDS =
+  "app's window has no known position on the screen, so node bounds, boundingBox() included, may be offset from screen coordinates.";
+
+/**
  * The `details.reason` values agent-device refuses an action with, nothing
  * sent, on a healthy device, each with the hint the failure carries:
  * `undefined` keeps agent-device's own, and a string replaces it.
@@ -115,7 +129,7 @@ const NOT_ACTIONABLE_REASONS: ReadonlyMap<string, string | undefined> = new Map(
   ['tap_keyboard_occludes_target', undefined],
   [
     'window-origin-unknown',
-    "Nothing was sent. The app's window has no known position on the screen, so node bounds, boundingBox() included, may be offset from screen coordinates. For a tap, tap a screen point with screen.tapAt(), not one taken from those bounds.",
+    `Nothing was sent. The ${ORIGIN_UNKNOWN_BOUNDS} For a tap, tap a screen point with screen.tapAt(), not one taken from those bounds.`,
   ],
 ]);
 
@@ -223,6 +237,11 @@ function runnerMessage(
   return `${operation} failed: ${state.headline}${location}: ${message(cause)} The app is fine. ${state.firstMove} ${RUNNER_RECOVERY}`;
 }
 
+/** Whether agent-device refused a command because its session does not exist: closed already, or never opened. */
+export function isNoSession(cause: unknown): boolean {
+  return normalizeAgentDeviceError(cause).code === 'SESSION_NOT_FOUND' || details(cause).reason === NO_SESSION_REASON;
+}
+
 /**
  * Translates an unexpected agent-device error at the contract boundary.
  * `where` names the session and device the command ran under, for the
@@ -234,7 +253,7 @@ export function translateError(cause: unknown, operation: string, where?: string
   const normalized = normalizeAgentDeviceError(cause);
   const text = `${operation} failed: ${withHint(cause, normalized.message)}`;
   const options = { retryable: false, cause };
-  if (normalized.code === 'SESSION_NOT_FOUND' || details(cause).reason === NO_SESSION_REASON) {
+  if (isNoSession(cause)) {
     return new EngineError('INVALID_STATE', text, options);
   }
   if (UNSUPPORTED_CODES.has(normalized.code) || UNSUPPORTED_PATTERN.test(normalized.message)) {
@@ -288,6 +307,48 @@ export function isAppNotRunning(error: unknown): boolean {
   return error instanceof Error && details(error.cause).runnerErrorCode === 'APP_NOT_RUNNING';
 }
 
+/**
+ * The `DEVICE_IN_USE` reasons that mean another live session holds the
+ * device: a claim agent-device verified, a workspace session, or a session of
+ * the same daemon, which carries no reason. A dead owner awaiting recovery, a
+ * claim it cannot verify, and a device under human control or provider
+ * release are left out: each comes with its own advice.
+ */
+const LIVE_HOLDER_REASONS: ReadonlySet<unknown> = new Set([undefined, 'DEVICE_CLAIM_LIVE_OWNER', 'WORKSPACE_SESSION_SCOPE_CONFLICT']);
+
+/**
+ * How agent-device names the claim one command (boot, prepare, install, push)
+ * takes for its own length: `transient:<command>`. It ends with the command.
+ */
+const TRANSIENT_HOLDER = 'transient:';
+
+/**
+ * The session holding the device, for a translated command agent-device
+ * refused because another live session holds that device, as its claim
+ * (`owner.session`) or its daemon (`session`) names it, a short-lived
+ * command's claim included; `undefined` for any other failure.
+ */
+export function deviceHolder(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !isAgentDeviceError(error.cause) || normalizeAgentDeviceError(error.cause).code !== 'DEVICE_IN_USE') return undefined;
+  const { reason, owner, session } = details(error.cause);
+  if (!LIVE_HOLDER_REASONS.has(reason)) return undefined;
+  const holder = typeof owner === 'object' && owner !== null ? (owner as { session?: unknown }).session : session;
+  return typeof holder === 'string' ? holder : undefined;
+}
+
+/**
+ * True when `deviceHolder` reads a short-lived command's claim: agent-device
+ * writes `transient:<command>` only as a claim refusal's `owner.session`, and
+ * the claim ends with the command. A session of the same daemon or a
+ * workspace session is a live holder whatever its name.
+ */
+export function isShortLivedClaim(error: unknown): boolean {
+  if (deviceHolder(error) === undefined || !(error instanceof Error)) return false;
+  const { owner } = details(error.cause);
+  const session = typeof owner === 'object' && owner !== null ? (owner as { session?: unknown }).session : undefined;
+  return typeof session === 'string' && session.startsWith(TRANSIENT_HOLDER);
+}
+
 /** True for a translated `open` agent-device refused because no installed app matches the name. */
 export function isAppNotInstalled(error: unknown): boolean {
   return error instanceof Error && isAgentDeviceError(error.cause) && normalizeAgentDeviceError(error.cause).code === 'APP_NOT_INSTALLED';
@@ -303,6 +364,50 @@ export async function runCommand<T>(label: string, work: () => Promise<T>, signa
   } catch (cause) {
     throw translateError(cause, label, where);
   }
+}
+
+/**
+ * The `details.reason` agent-device refuses a gesture with, before anything is
+ * sent, when a point of its path leaves the viewport it checks against: the
+ * rect in `details.viewport`, the refused point in `details.sample.point`.
+ * On iOS that rect stops at the open soft keyboard's top edge for a swipe and
+ * keeps the screen's full width, while since agent-device 0.21.42 a timed
+ * pan's rect keeps the keyboard in it.
+ */
+const OUT_OF_BOUNDS_REASON = 'GESTURE_TRAJECTORY_OUT_OF_BOUNDS';
+
+function rectIn(value: unknown): { readonly x: number; readonly y: number; readonly width: number; readonly height: number } | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { x, y, width, height } = value as Record<string, unknown>;
+  return typeof x === 'number' && typeof y === 'number' && typeof width === 'number' && typeof height === 'number' ? { x, y, width, height } : undefined;
+}
+
+/**
+ * A `screen.swipe({ from, to })` agent-device refused for a path outside its
+ * viewport: `NOT_ACTIONABLE`, since nothing was sent and the device is fine.
+ * The hint names `duration` only when the keyboard is what refused it: an
+ * untimed swipe whose refused point lies inside the screen (`screen`, read
+ * fresh, with agent-device's 1-point inset) but below the viewport's cut
+ * bottom edge, the only point a timed pan would take. Any other refusal keeps
+ * agent-device's own hint (an edge point, screenshot pixels), and an error
+ * with another reason is returned unchanged.
+ */
+export async function refusedSwipePath(cause: unknown, operation: string, timed: boolean, screen: () => Promise<ViewportSize>): Promise<unknown> {
+  const { reason, viewport, sample } = details(cause);
+  if (reason !== OUT_OF_BOUNDS_REASON) return cause;
+  const checked = rectIn(viewport);
+  const point = typeof sample === 'object' && sample !== null ? (sample as Record<string, unknown>).point : undefined;
+  const at = typeof point === 'object' && point !== null ? (point as Record<string, unknown>) : {};
+  const { x, y } = at;
+  const belowCut = !timed && checked !== undefined && typeof x === 'number' && typeof y === 'number' &&
+    x >= checked.x + 1 && x <= checked.x + checked.width && y > checked.y + checked.height;
+  const size = belowCut ? await screen().catch(() => undefined) : undefined;
+  const keyboardCut = size !== undefined && checked !== undefined && typeof y === 'number' &&
+    checked.width === size.width && checked.height < size.height && y <= size.height - 1;
+  const text = keyboardCut
+    ? `${message(cause)} Hint: Nothing was sent. The open soft keyboard cuts the ${size.height}-point screen to that viewport for a swipe with no duration; pass duration to send the path as given, across the keyboard.`
+    : withHint(cause, message(cause));
+  return new EngineError('NOT_ACTIONABLE', `${operation} failed: ${text}`, { retryable: false, cause });
 }
 
 /**

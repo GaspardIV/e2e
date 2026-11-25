@@ -41,19 +41,23 @@ import {
   type Secret,
   type SemanticNode,
   type VideoSegment,
+  type ViewportIntersection,
   type ViewportPoint,
   type ViewportSize,
 } from '@e2e-dev/core/engine';
 import { matchesText } from '@e2e-dev/core/engine';
 import { classifyActionError, classifyInputError, dispatchLocatorAction, dispatchPointerAction } from './actions.ts';
-import { BrowserConnection, connectCdp, type BrowserName } from './browser-connection.ts';
+import { BrowserConnection, connectCdp, defaultChromiumSandbox, type BrowserLaunchOptions, type BrowserName } from './browser-connection.ts';
+import { grantedPermissions, grantPermissions } from './permissions.ts';
 import { AttemptSession, type AttemptTab, type StorageState } from './attempt-session.ts';
 import type { CdpEndpointResolver } from './cdp-recovery.ts';
+import { webmcpLaunch } from './webmcp.ts';
 import { LeasedBrowsers, type BrowserProvider, type LeaseDownloads } from './provider.ts';
 import { installAppLog } from './app-log.ts';
 import { TraceFeed } from './trace-feed.ts';
 import { DialogRouter } from './dialogs.ts';
-import { browserCheck, ensureBrowsersInstalled } from './install.ts';
+import { missingLibrariesMessage } from './host-libraries.ts';
+import { browserCheck, ensureBrowsersInstalled, missingBrowserLibraries } from './install.ts';
 import { applyPostSteps, frameSelectors, projectExpression } from './locators.ts';
 import { contentBox, frameContentInset, placeBoxInFrame, ROOT_NODE_ID, toSemanticNode } from './observation.ts';
 import { captureObservation } from './observation-capture.ts';
@@ -140,7 +144,7 @@ export interface WebConnectOptions {
    * same browser after a transport drop. Called once before the next
    * operation, within its budget. The original browser and page must survive.
    * Dispatched operations are never retried. The host owns browser cleanup.
-   * Context replacement, headers, basicAuth, userAgent, locale, and timezoneId are unavailable in this mode.
+   * Context replacement, headers, basicAuth, userAgent, locale, timezoneId, and deviceScaleFactor are unavailable in this mode.
    */
   readonly reconnectEndpoint?: CdpEndpointResolver;
 }
@@ -179,12 +183,29 @@ export interface WebOptions {
    */
   readonly browser?: BrowserName | BrowserProvider;
   /**
+   * Whether a locally launched Chromium runs with its OS sandbox on; default
+   * `true` on macOS and Windows, `false` on Linux.
+   */
+  readonly chromiumSandbox?: boolean;
+  /**
    * Initial viewport of every attempt's page; default 1280 by 720. `null`
    * emulates no size: the page fills the browser window, whatever size the
    * window has (a hosted browser's live view, a headed run), and
    * `browser.setViewport` still fixes one for the rest of the attempt.
    */
   readonly viewport?: ViewportSize | null;
+  /**
+   * Device pixels per CSS pixel on every attempt's page, as
+   * `window.devicePixelRatio` reads it; default 1. At 2 the page renders as
+   * on a high-density display, and every saved screenshot
+   * (`app.screenshot()`, a failure's, an `agent.assert`'s) is twice the
+   * viewport's size on each side. The factor does not change the image the
+   * model reads or the one `toHaveScreenshot` compares. It needs a viewport
+   * size, so `viewport: null` refuses it, and a persistent context
+   * (`connect.reconnectEndpoint`, or a provider with `scope: 'attempt'`)
+   * refuses it.
+   */
+  readonly deviceScaleFactor?: number;
   /**
    * How the engine's own screencast records an attempt that records video.
    * A browser provider that records (`BrowserProvider.record`) records in
@@ -282,6 +303,16 @@ export interface WebOptions {
    * function, which cannot close over test variables.
    */
   readonly initScripts?: readonly WebInitScript[];
+  /**
+   * Launches the browser with WebMCP, the experimental browser API a page
+   * registers tools through (`document.modelContext`, `navigator.modelContext`
+   * on Firefox), so `browser.webmcp` can list and call them. Off by default:
+   * with it the page sees an API most browsers do not have yet. Chromium and
+   * Firefox, and only for a browser the engine launches; one reached through
+   * `connect` or a provider has to be started with `--enable-features=WebMCP`
+   * itself.
+   */
+  readonly webmcp?: boolean;
 }
 
 /** The test-id attribute when the options name none. */
@@ -297,12 +328,18 @@ export class PlaywrightSurface {
 
   private readonly browserName: BrowserName;
   private readonly connection = new BrowserConnection();
+  private readonly chromiumSandbox: boolean;
+  /** What the options add to the launch of the browser the engine launches. */
+  private readonly launch: BrowserLaunchOptions;
   private readonly connect: WebConnectOptions | undefined;
   /** The provider's browsers, when `browser` names one; the runner and worker halves of the lease bookkeeping. */
   private readonly leases: LeasedBrowsers | undefined;
   private session: AttemptSession | undefined;
+  /** Set by `init`: a handle no target runs on never gets there. */
+  private started = false;
   private readonly usedContexts = new Set<string>();
   private readonly viewport: ViewportSize | null;
+  private readonly deviceScaleFactor: number | undefined;
   private readonly screencast: WebScreencastOptions;
   /** Injected request headers, names lowercased so they replace the browser's own of the same name. */
   private readonly headers: Readonly<Record<string, string>> | undefined;
@@ -340,9 +377,12 @@ export class PlaywrightSurface {
 
   constructor(options: WebOptions) {
     this.browserName = typeof options.browser === 'string' ? options.browser : 'chromium';
+    this.chromiumSandbox = options.chromiumSandbox ?? defaultChromiumSandbox();
     this.leases = typeof options.browser === 'object' && options.browser !== null ? new LeasedBrowsers(options.browser) : undefined;
     this.connect = options.connect;
+    this.launch = options.webmcp === true ? webmcpLaunch(this.browserName) : {};
     this.viewport = options.viewport === undefined ? DEFAULT_VIEWPORT : options.viewport;
+    this.deviceScaleFactor = options.deviceScaleFactor;
     this.screencast = options.screencast ?? {};
     this.headers = options.headers === undefined ? undefined : lowercaseNames(options.headers);
     this.credentialOrigins = options.credentialOrigins;
@@ -390,6 +430,7 @@ export class PlaywrightSurface {
 
   /** Provisions the shared browser once per worker: a local launch, or a CDP attach. */
   async init(info: EngineInitInfo): Promise<void> {
+    this.started = true;
     // A runner older than the peer floor passes no origin; fail rather than send the credentials nowhere.
     if (info.app.origin === undefined && (this.headers !== undefined || this.basicAuth !== undefined)) {
       throw new ConfigurationError('INVALID_CONFIG', 'web({ headers, basicAuth }) needs an e2e runner that tells the engine the app\'s origin; update e2e to the release beside this @e2e-dev/web');
@@ -426,13 +467,24 @@ export class PlaywrightSurface {
     if (signal.aborted) throw cancelled(`browser ${verb} cancelled`);
     try {
       return await raceAbort(
-        this.connection.acquire(this.browserName, this.headed, BROWSER_LAUNCH_TIMEOUT_MS, this.connector(signal)),
+        this.connection.acquire({
+          name: this.browserName,
+          headed: this.headed,
+          timeoutMs: BROWSER_LAUNCH_TIMEOUT_MS,
+          chromiumSandbox: this.chromiumSandbox,
+          launch: this.launch,
+          connect: this.connector(signal),
+        }),
         signal,
         `browser ${verb}`,
       );
     } catch (cause) {
       if (cause instanceof EngineError) throw cause;
-      throw new EngineError('ENGINE_FAILURE', `browser ${verb} failed: ${message(cause)}`, {
+      // The probe is the one await after the launch settled, so it stops with the init signal too.
+      const missing = verb === 'launch' ? await missingBrowserLibraries(this.browserName, process.env, this.headed, { signal }) : [];
+      // The launch's own reason follows the advice: it can name a second fault the libraries do not explain.
+      const reason = missing.length > 0 ? `${missingLibrariesMessage(this.browserName, missing)}\nlaunch error: ${message(cause)}` : message(cause);
+      throw new EngineError('ENGINE_FAILURE', `browser ${verb} failed: ${reason}`, {
         retryable: false,
         cause,
       });
@@ -528,7 +580,7 @@ export class PlaywrightSurface {
     const routes: StoredRoute[] = [];
     const initScripts = this.configuredInitScripts.forAttempt();
     // `validateApp` admitted only grants.
-    const granted = Object.keys(this.app.permissions ?? {});
+    const granted = grantedPermissions(this.browserName, this.app);
     this.latch = new ErrorLatch();
     const dialogs = new DialogRouter(this.latch);
     this.routes = routes;
@@ -542,6 +594,7 @@ export class PlaywrightSurface {
       acquire: (signal) => this.acquireBrowser(signal),
       contextOptions: {
         viewport: this.viewport,
+        ...(this.deviceScaleFactor === undefined ? {} : { deviceScaleFactor: this.deviceScaleFactor }),
         acceptDownloads: true,
         ...(credentials === undefined ? {} : { httpCredentials: credentials }),
         ...(this.userAgent === undefined ? {} : { userAgent: this.userAgent }),
@@ -563,7 +616,7 @@ export class PlaywrightSurface {
           testPage: () => this.openPage(),
         });
         await installConfiguredHeaders(target, this.credentialScope, this.headers);
-        if (granted.length > 0) await target.grantPermissions(granted);
+        if (granted.length > 0) await grantPermissions(target, granted, this.app.allPermissions === true);
         for (const stored of routes) await target.route(stored.predicate, stored.handler);
       },
       ...(persistent === undefined ? {} : { persistent }),
@@ -624,7 +677,9 @@ export class PlaywrightSurface {
 
   /** Returns the active attempt, including its connection generation and references. */
   private requireSession(): AttemptSession {
-    if (this.session === undefined) throw invalidState('no attempt is running');
+    if (this.session === undefined) {
+      throw invalidState(this.started ? 'no attempt is running' : 'no attempt is running on this engine handle, which has not started in this process: use the handle the target runs on, not a new web(), from code a test runs');
+    }
     return this.session;
   }
 
@@ -720,6 +775,11 @@ export class PlaywrightSurface {
   /** Emulates media features on the open page, or the one the next navigation opens, for the rest of the attempt. */
   emulateMedia(media: WebMedia): Promise<void> {
     return this.requireSession().emulateMedia(media);
+  }
+
+  /** Takes the attempt's browser offline or back online, for the rest of the attempt. */
+  setOffline(offline: boolean): Promise<void> {
+    return this.requireSession().setOffline(offline);
   }
 
   /**
@@ -823,8 +883,9 @@ export class PlaywrightSurface {
   /**
    * Runs one navigation the engine itself makes, so the app log leaves it to
    * the step that asked for it. A navigation that fails after a test route
-   * aborted its document request failed because the test aborted it: an
-   * action failure, not an engine fault.
+   * aborted its document request, or while the test holds the browser
+   * offline, failed because of what the test did: an action failure, not an
+   * engine fault.
    */
   async navigating<T>(work: () => Promise<T>): Promise<T> {
     this.ownNavigations += 1;
@@ -835,8 +896,14 @@ export class PlaywrightSurface {
       this.trace?.tellEnvironment();
       return result;
     } catch (cause) {
-      if (watch.url === undefined || isClassified(cause) || isPwTimeout(cause)) throw cause;
-      throw new TestError('ACTION_FAILED', `navigation failed: a route aborted the request for ${watch.url}: ${message(cause)}`, { cause });
+      if (isClassified(cause) || isPwTimeout(cause)) throw cause;
+      const reason = watch.url !== undefined
+        ? `a route aborted the request for ${watch.url}`
+        : this.session?.navigatedOffline() === true
+          ? "the browser is offline (browser.setNetwork('offline'))"
+          : undefined;
+      if (reason === undefined) throw cause;
+      throw new TestError('ACTION_FAILED', `navigation failed: ${reason}: ${message(cause)}`, { cause });
     } finally {
       this.navigationAborts.delete(watch);
       this.ownNavigations -= 1;
@@ -852,6 +919,31 @@ export class PlaywrightSurface {
     const main = this.openPage()?.mainFrame();
     if (main === undefined || frameOf(request) !== main) return;
     for (const watch of this.navigationAborts) watch.url ??= request.url();
+  }
+
+  /**
+   * Runs page code that may send the page to another document. When it fails
+   * because the page navigated under it, the new document is left to load
+   * before the failure is thrown, so the step after it does not race that
+   * navigation. The failure itself is thrown unchanged.
+   */
+  async throughNavigation<T>(page: Page, operation: OperationContext, work: () => Promise<T>): Promise<T> {
+    const deadline = new Deadline(operation.timeoutMs);
+    const documents = watchDocuments(page);
+    try {
+      return await work();
+    } catch (cause) {
+      if (isNavigationRace(cause) && !isPwTimeout(cause) && !operation.signal.aborted) {
+        // As in `screenshot`: the rejection can arrive before the commit's `framenavigated`.
+        await documents.whenReplaced(Math.min(NAVIGATION_EVENT_GRACE_MS, deadline.remaining()));
+        if (documents.replaced()) {
+          await page.waitForLoadState('load', { timeout: Math.max(1, deadline.remaining()) }).catch(() => undefined);
+        }
+      }
+      throw cause;
+    } finally {
+      documents.stop();
+    }
   }
 
   /** Resolves with what an action resolved with once the trace has the screen it left (`TraceFeed.screenAfterAction`); an action that failed leaves none. */
@@ -893,6 +985,45 @@ export class PlaywrightSurface {
       if (style === null) throw new EngineError('NODE_STALE', 'node is detached; observe again before reading', { retryable: true });
       return style;
     }, navigationStaleOr);
+  }
+
+  /**
+   * Measures how much of a located or observed element is inside the
+   * viewport with the page's `IntersectionObserver`, the check Playwright's
+   * `toBeInViewport` makes, so scrolling and overflow ancestors and frames
+   * clip it. An element with no box, or an empty one, is outside. It runs
+   * in the page's own world, as `readStyle` does, so an app that replaces
+   * `IntersectionObserver` changes what it reads.
+   */
+  viewportIntersection(ref: NodeRef, operation: OperationContext): Promise<ViewportIntersection> {
+    return this.guard(operation, 'measure viewport intersection', (currentOperation) => this.readingTab(async () => {
+      const target = await this.requireSession().refs.lookup(ref);
+      let element: ElementHandle;
+      if (target.kind === 'element') {
+        element = target.element;
+      } else {
+        // A strict locator that matches anything but one element no longer names the node it located.
+        const handles = await target.locator.elementHandles();
+        if (handles.length !== 1) {
+          for (const handle of handles) void handle.dispose().catch(() => undefined);
+          throw new EngineError('NODE_STALE', `node reference ${ref.id} no longer matches one element`, { retryable: true });
+        }
+        element = handles[0]!;
+      }
+      try {
+        currentOperation.signal.throwIfAborted();
+        const measured = await element.evaluate(measureViewportIntersection);
+        if (measured === 'detached') throw new EngineError('NODE_STALE', 'node is detached; locate it again', { retryable: true });
+        if (measured === 'unsupported') {
+          throw new EngineError('UNSUPPORTED_CAPABILITY', 'the browser has no IntersectionObserver to measure the viewport with', {
+            retryable: false,
+          });
+        }
+        return measured;
+      } finally {
+        if (target.kind === 'locator') void element.dispose().catch(() => undefined);
+      }
+    }), navigationStaleOr);
   }
 
   // --- location tier ---
@@ -1380,7 +1511,7 @@ function withTabs(snapshot: EngineSnapshot, session: AttemptSession): EngineSnap
 }
 
 /**
- * How long a screenshot waits for the navigation event after Playwright has
+ * How long a screenshot or a page call waits for the navigation event after Playwright has
  * already reported the document's context destroyed. The event is the commit
  * that destroyed the context, queued behind the capture's rejection.
  */
@@ -1442,4 +1573,39 @@ function inFrame(node: SemanticNode, frame: Rect | null | undefined): SemanticNo
   if (frame === undefined || node.rect === undefined) return node;
   const { rect, origin, ...rest } = node;
   return frame === null ? rest : { ...rest, ...placeBoxInFrame(rect, origin, frame) };
+}
+
+/**
+ * The in-page half of `viewportIntersection`: one `IntersectionObserver`
+ * callback, which reports the element's first intersection right after it
+ * is observed. The empty animation frame makes Firefox deliver it. The
+ * callback's own entry decides: an element the page replaced before it
+ * fired is stale, and its box and ratio come from that one frame, since a
+ * zero-area target that intersects reports a ratio of 1.
+ */
+function measureViewportIntersection(element: Element): Promise<ViewportIntersection | 'detached' | 'unsupported'> {
+  if (!element.isConnected) return Promise.resolve('detached');
+  if (element.getClientRects().length === 0) return Promise.resolve({ intersects: false, ratio: 0 });
+  const view = element.ownerDocument.defaultView;
+  if (view === null || typeof view.IntersectionObserver !== 'function') return Promise.resolve('unsupported');
+  return new Promise((resolve) => {
+    const observer = new view.IntersectionObserver((entries) => {
+      observer.disconnect();
+      if (!element.isConnected) {
+        resolve('detached');
+        return;
+      }
+      const entry = entries.at(-1);
+      const box = entry?.boundingClientRect;
+      if (entry === undefined || box === undefined || box.width <= 0 || box.height <= 0) {
+        resolve({ intersects: false, ratio: 0 });
+        return;
+      }
+      // Clamped: a browser can round a fully visible box a hair past 1.
+      const ratio = Math.min(1, Math.max(0, entry.intersectionRatio));
+      resolve({ intersects: ratio > 0, ratio });
+    });
+    observer.observe(element);
+    view.requestAnimationFrame(() => {});
+  });
 }

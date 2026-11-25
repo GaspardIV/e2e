@@ -20,6 +20,7 @@ import { sessionRecordings } from './recordings.ts';
 import { resolveSecretValue, sessionLedger } from './secrecy.ts';
 import { baseUrlOf, resolveNavigationUrl } from '../internal/urls.ts';
 import { FixtureRecorder } from './fixture-recording.ts';
+import { createRequest } from './request.ts';
 import type { AttemptBudget } from './budget.ts';
 import { LocatorEngine } from '../locator/engine.ts';
 import {
@@ -31,7 +32,7 @@ import {
 } from '../locator/screen.ts';
 import { engineAppInfo, joinLink, refusesLink } from '../config/app.ts';
 import type { ResolvedAgentConfig, ResolvedConfig, ResolvedTarget } from '../config/resolve.ts';
-import type { Agent, App, CommandConfig, Expectable, RecordingOptions, SetupSession, TestFixtures } from '../types.ts';
+import type { App, CommandConfig, Expectable, FixtureScope, RecordingOptions, SetupSession, TestFixtures } from '../types.ts';
 import type { StepRecord, StepRecorder } from './steps.ts';
 
 export interface ArtifactSink {
@@ -44,13 +45,15 @@ export interface ArtifactSink {
     options?: ArtifactRegistration,
   ): string;
   /** Registers a video a hosted service keeps, by URL, and returns its report artifact ID; nothing is read or stored. */
-  link(url: string, options: { readonly mediaType: string; readonly startedAt: string }): string;
+  link(url: string, options: { readonly mediaType: string; readonly startedAt: string; readonly actor?: string | undefined }): string;
 }
 
 /** Facts about a produced artifact its file does not carry. */
 export interface ArtifactRegistration {
   /** When a time-based artifact (a video segment) began recording. */
   readonly startedAt?: string;
+  /** The session that produced it when it is not the test's own; see `StepRecord.actor`. */
+  readonly actor?: string;
 }
 
 export interface AttemptEnvironment {
@@ -104,6 +107,7 @@ interface ScreenWiring {
   readonly config: ResolvedConfig;
   readonly steps: StepRecorder;
   readonly secrets: SecretResolver;
+  readonly artifacts: ArtifactSink;
   /** The session's secret ledger, which `screen.tree()` passes its text through. */
   readonly redaction: NodeRedaction;
   /** The app URL's origin, so the tree shows a link on it by its path. */
@@ -134,6 +138,7 @@ export function createScreenContext(wiring: ScreenWiring): ScreenContext {
     engine,
     steps,
     secrets: wiring.secrets,
+    artifacts: wiring.artifacts,
     projectRoot: config.projectRoot,
     renderTree: (observation) =>
       prepareObservation(observation, {
@@ -160,6 +165,7 @@ export function createFixtures(environment: AttemptEnvironment): AttemptFixtures
     config: environment.config,
     steps: environment.steps,
     secrets,
+    artifacts: environment.artifacts,
     redaction: ledger,
     appOrigin: environment.target.app.base?.origin,
     ...(environment.test === undefined
@@ -178,10 +184,6 @@ export function createFixtures(environment: AttemptEnvironment): AttemptFixtures
         }),
   });
   const { engine } = screenContext;
-  const screen = createScreen(screenContext);
-  const app = createApp(environment, engine);
-
-  let agent: Agent | undefined;
 
   /**
    * The agents this attempt can run with, resolved once each: the test's pin
@@ -250,18 +252,79 @@ export function createFixtures(environment: AttemptEnvironment): AttemptFixtures
     ...(environment.debug !== undefined ? { debug: environment.debug } : {}),
   };
 
-  const fixtures: TestFixtures & { session: SetupSession } = {
-    get agent(): Agent {
-      if (agent !== undefined) return agent;
-      // The attempt's own agent is checked as the fixture is acquired, as before.
-      select(undefined);
-      agent = createAgentFixture(agentRuntime);
-      return agent;
+  const context: CoreFixtureContext = { environment, engine, screenContext, agentRuntime };
+  const factories: Record<string, () => unknown> = {};
+  for (const [name, fixture] of Object.entries(CORE_FIXTURES)) {
+    factories[name] = 'ofTarget' in fixture ? () => fixture.ofTarget(environment.target) : () => fixture.create(context);
+  }
+  Object.assign(factories, contributedFactories(environment, engine, screenContext));
+  // Accessors: a fixture is built on first touch, whether or not the test body reaches it, and kept.
+  const fixtures = {} as AttemptFixtures['fixtures'];
+  for (const [name, create] of Object.entries(factories)) {
+    Object.defineProperty(fixtures, name, { enumerable: true, get: lazily(create) });
+  }
+
+  return { fixtures: gateUnknownFixtures(fixtures, environment), agentRuntime };
+}
+
+/**
+ * How long a core fixture lives: one test attempt, the worker, or, for
+ * `engine`, as long as the state behind the engine's own fixtures, which the
+ * engine declares (`isolation`).
+ */
+type CoreFixtureScope = 'test' | 'worker' | 'engine';
+
+/** What a core fixture is built from: the attempt, and the parts its fixtures share. */
+interface CoreFixtureContext {
+  readonly environment: AttemptEnvironment;
+  readonly engine: LocatorEngine;
+  readonly screenContext: ScreenContext;
+  readonly agentRuntime: AgentContext;
+}
+
+type CoreFixtureValues = AttemptFixtures['fixtures'];
+
+/**
+ * What the built-in fixtures of a target are read from: its name, its
+ * platform, its engine's name, fixtures, and isolation, and the fixture
+ * scopes of every target.
+ */
+export type BuiltInTarget = Pick<ResolvedTarget, 'name' | 'platform' | 'fixtureScopes'> & {
+  readonly engine?: Pick<NonNullable<ResolvedTarget['engine']>, 'name' | 'isolation' | 'fixtures'> | undefined;
+};
+
+/**
+ * One core fixture: its scope, and how it is built. Most are built from the
+ * attempt (`create`); one the target alone decides (`ofTarget`) needs no
+ * attempt, so code that outlives every attempt can read it.
+ */
+type CoreFixture<Value> = { readonly scope: CoreFixtureScope } & (
+  | { create(context: CoreFixtureContext): Value }
+  | { ofTarget(target: Pick<BuiltInTarget, 'platform'>): Value }
+);
+
+/**
+ * The fixtures every attempt has, whatever its engine: each one's name, its
+ * scope, and how it is built. `createFixtures` builds them through this
+ * table, beside the engine's own (`Engine.fixtures`); everything else reads
+ * it through `builtInFixtures`.
+ */
+export const CORE_FIXTURES: { readonly [Name in keyof CoreFixtureValues]: CoreFixture<CoreFixtureValues[Name]> } = {
+  agent: {
+    scope: 'test',
+    create({ agentRuntime }) {
+      // The attempt's own agent is checked as the fixture is acquired.
+      agentRuntime.select(undefined);
+      return createAgentFixture(agentRuntime);
     },
-    app,
-    screen,
-    platform: environment.target.platform,
-    session: {
+  },
+  app: { scope: 'engine', create: ({ environment, engine }) => createApp(environment, engine) },
+  screen: { scope: 'engine', create: ({ screenContext }) => createScreen(screenContext) },
+  platform: { scope: 'worker', ofTarget: (target) => target.platform },
+  request: { scope: 'test', create: ({ environment, engine }) => createRequest({ environment, actionTimeout: () => engine.actionTimeout }) },
+  session: {
+    scope: 'test',
+    create: ({ environment }) => ({
       save: async (name: string) => {
         const saveSession = environment.saveSession;
         if (saveSession === undefined) {
@@ -272,17 +335,86 @@ export function createFixtures(environment: AttemptEnvironment): AttemptFixtures
         }
         await environment.steps.run('session', 'session.save', name, () => saveSession(name));
       },
-    },
-  };
-  // Defined as accessors, not spread: spreading would invoke every factory
-  // eagerly, before the test body and whether or not it touches the fixture.
-  Object.defineProperties(
-    fixtures,
-    Object.getOwnPropertyDescriptors(contributedFixtures(environment, engine, screenContext)),
-  );
+    }),
+  },
+};
 
-  return { fixtures: gateUnknownFixtures(fixtures, environment), agentRuntime };
+/** The table by any name: `CORE_FIXTURES` typed for a lookup that may miss. */
+const CORE_FIXTURE: Readonly<Record<string, CoreFixture<unknown> | undefined>> = CORE_FIXTURES;
+
+/** The table's entry for `name`, when it is a core fixture. */
+function coreFixture(name: string): CoreFixture<unknown> | undefined {
+  return Object.hasOwn(CORE_FIXTURE, name) ? CORE_FIXTURE[name] : undefined;
 }
+
+/** Whether reading `name` takes an attempt: true of every fixture but a core one the target alone decides. */
+function needsAttempt(name: string): boolean {
+  const fixture = coreFixture(name);
+  return fixture === undefined || !('ofTarget' in fixture);
+}
+
+/**
+ * The built-in fixtures of a target: the core ones and the ones its engine
+ * contributes. The one place that knows their names, their scopes, and which
+ * of them need an attempt.
+ */
+export interface BuiltInFixtures {
+  /** The target the fixtures are of, for an error to name; undefined before one is known. */
+  readonly targetName: string | undefined;
+  /** Every built-in fixture name: the core ones, the engine's, then the ones only other targets have. */
+  readonly names: readonly string[];
+  /**
+   * How long `name` lives: one test attempt or the worker. The engine's own
+   * fixtures, `app`, and `screen` live as long as the state behind them,
+   * which the engine declares (`isolation`), so before a target is known
+   * they are `unresolved`, as is any name an engine might contribute.
+   * A fixture only other targets have takes its scope from them.
+   * Undefined when no target has a built-in fixture of that name.
+   */
+  scope(name: string): FixtureScope | 'unresolved' | undefined;
+  /** Whether reading `name` takes an attempt on the engine: every built-in but the ones the target alone decides. */
+  needsAttempt(name: string): boolean;
+  /** The value of a built-in that needs no attempt. */
+  attemptless(name: string): unknown;
+  /** Why the target has no fixture `name`, beside the fixtures `available` to the code that asked. */
+  missing(name: string, available: readonly string[]): string;
+}
+
+/** The built-in fixtures of `target`. */
+export function builtInFixtures(target: BuiltInTarget): BuiltInFixtures {
+  const contributed = Object.keys(target.engine?.fixtures ?? {});
+  const engineScope: FixtureScope = target.engine?.isolation === 'worker' ? 'worker' : 'test';
+  return {
+    targetName: target.name,
+    names: [...new Set([...Object.keys(CORE_FIXTURES), ...contributed, ...target.fixtureScopes.keys()])],
+    scope(name) {
+      const scope = coreFixture(name)?.scope ?? (contributed.includes(name) ? 'engine' : target.fixtureScopes.get(name));
+      return scope === 'engine' ? engineScope : scope;
+    },
+    needsAttempt: (name) => (contributed.includes(name) || !target.fixtureScopes.has(name)) && needsAttempt(name),
+    attemptless(name) {
+      const fixture = coreFixture(name);
+      return fixture !== undefined && 'ofTarget' in fixture ? fixture.ofTarget(target) : undefined;
+    },
+    missing: (name, available) => unknownFixtureMessage(target, name, available),
+  };
+}
+
+/**
+ * The built-in fixtures as a `test.extend()` call can know them, before any
+ * target is: the core ones whose scope no engine changes. Every other name
+ * is `unresolved`, since an engine may contribute it, so none is missing.
+ */
+export const DECLARED_BUILT_INS: Omit<BuiltInFixtures, 'attemptless'> = {
+  targetName: undefined,
+  names: Object.keys(CORE_FIXTURES),
+  scope(name) {
+    const scope = coreFixture(name)?.scope ?? 'engine';
+    return scope === 'engine' ? 'unresolved' : scope;
+  },
+  needsAttempt,
+  missing: (name) => `no fixture is called "${name}"`,
+};
 
 /** Keys a test body may probe without meaning a fixture. */
 const PROBED_KEYS = new Set(['then', 'constructor', 'toJSON', 'toString', 'valueOf', 'inspect']);
@@ -291,62 +423,60 @@ const PROBED_KEYS = new Set(['then', 'constructor', 'toJSON', 'toString', 'value
 const FOREIGN_FIXTURE_HINTS: Readonly<Record<string, string>> = {
   page: 'there is no Playwright page: open the app with app.open() and find elements through screen; browser-only APIs are on the browser fixture of a Playwright target',
   context: 'the browser context is owned by the engine: cookies, routes, and storage are on the browser fixture of a Playwright target',
-  request: 'there is no request fixture: call fetch() directly, or reach the browser through the browser fixture of a Playwright target',
   driver: 'there is no WebDriver session: drive the device through app, screen, and (on an agent-device target) device',
 };
 
 /**
- * Reaching for a fixture the target's engine does not contribute fails at
- * the first touch with the earliest honest error: the engine's name and what
- * it does declare, instead of a TypeError three lines later.
+ * Why `target` has no fixture called `property`: the fixtures it does have
+ * (`available`), what its engine contributes, and either the nearest name or,
+ * for a fixture another runner hands out, the e2e way of doing the same thing.
+ */
+function unknownFixtureMessage(target: BuiltInTarget, property: string, available: readonly string[]): string {
+  const declared = Object.keys(target.engine?.fixtures ?? {});
+  const contributed = `engine ${target.engine?.name ?? 'none'} contributes ${declared.length === 0 ? 'no fixtures' : declared.join(', ')}`;
+  const foreign = FOREIGN_FIXTURE_HINTS[property];
+  const hint = foreign === undefined ? didYouMean(property, available) : `; ${foreign}`;
+  return `target "${target.name}" has no "${property}" fixture; available: ${available.join(', ')} (${contributed})${hint}`;
+}
+
+/**
+ * Reaching for a fixture that isn't on any target in the config fails at the
+ * first touch with the earliest honest error: the engine's name and what it
+ * does declare, instead of a TypeError three lines later.
  */
 function gateUnknownFixtures<T extends object>(fixtures: T, environment: AttemptEnvironment): T {
+  const { fixtureScopes } = environment.target;
   return new Proxy(fixtures, {
     get(target, property, receiver) {
-      if (typeof property !== 'string' || property in target || PROBED_KEYS.has(property)) {
+      if (typeof property !== 'string' || property in target || PROBED_KEYS.has(property) || fixtureScopes.has(property)) {
         return Reflect.get(target, property, receiver) as unknown;
       }
-      const engine = environment.target.engine;
-      const declared = Object.keys(engine?.fixtures ?? {});
-      const available = Object.keys(target).toSorted();
-      const contributed = `engine ${engine?.name ?? 'none'} contributes ${declared.length === 0 ? 'no fixtures' : declared.join(', ')}`;
-      const foreign = FOREIGN_FIXTURE_HINTS[property];
-      const hint = foreign === undefined ? didYouMean(property, available) : `; ${foreign}`;
       throw new ConfigurationError(
         'UNSUPPORTED_CAPABILITY',
-        `target "${environment.target.name}" has no "${property}" fixture; available: ${available.join(', ')} (${contributed})${hint}`,
+        unknownFixtureMessage(environment.target, property, Object.keys(target).toSorted()),
       );
     },
   });
 }
 
 /**
- * Engine-contributed fixtures: factories declare operation metadata
- * through context.fixture and must return the surface they declared. Factories
- * stay lazy and each instance belongs to one test's fixture graph; the
- * session's ledger outlives that graph.
+ * Engine-contributed fixtures, as factories: an engine's factory declares
+ * operation metadata through context.fixture and must return the surface it
+ * declared. Each instance belongs to one test's fixture graph; the session's
+ * ledger outlives that graph.
  */
-function contributedFixtures(
+function contributedFactories(
   environment: AttemptEnvironment,
   engine: LocatorEngine,
   screenContext: ScreenContext,
-): Record<string, unknown> {
+): Record<string, () => unknown> {
   const declared = environment.target.engine?.fixtures;
   if (declared === undefined) return {};
-  const contributed: Record<string, unknown> = {};
   const recorder = new FixtureRecorder(environment, () => engine.actionTimeout);
   const context = fixtureContext(environment, engine, screenContext, recorder);
-  for (const [name, factory] of Object.entries(declared)) {
-    let instance: object | undefined;
-    Object.defineProperty(contributed, name, {
-      enumerable: true,
-      get() {
-        instance ??= recorder.require(name, factory(context));
-        return instance;
-      },
-    });
-  }
-  return contributed;
+  return Object.fromEntries(
+    Object.entries(declared).map(([name, factory]) => [name, () => recorder.require(name, factory(context))]),
+  );
 }
 
 function fixtureContext(
@@ -478,7 +608,10 @@ function unreachableApp(cause: unknown, url: string, command: CommandConfig | un
 }
 
 /** Builds the portable app fixture with the session's shared screenshot policy. */
-function createApp(environment: AttemptEnvironment, engine: LocatorEngine): App {
+export function createApp(
+  environment: Pick<AttemptEnvironment, 'config' | 'steps' | 'target' | 'session' | 'artifacts'>,
+  engine: LocatorEngine,
+): App {
   const { config, steps, target } = environment;
   const recordings = sessionRecordings(environment.session, target.name);
   /** What bounds an open, a restart, or a link open: the default a program set, else the test's timeout. */
@@ -497,7 +630,8 @@ function createApp(environment: AttemptEnvironment, engine: LocatorEngine): App 
   const navigate = (api: string, label: string, url: string | undefined): Promise<void> =>
     steps.run('app', api, label, async () => {
       requireAppUrl(target);
-      const resolved = url === undefined ? target.app.base.href : resolveNavigationUrl(url, target.app.base).url;
+      // The base goes through the rule too: a file app's file may have become a directory since the config loaded.
+      const resolved = resolveNavigationUrl(url ?? target.app.base.href, target.app.base).url;
       await openAt(resolved, lifecycleMs());
     });
 
@@ -514,7 +648,7 @@ function createApp(environment: AttemptEnvironment, engine: LocatorEngine): App 
       const deadline = new Deadline(lifecycleMs());
       await hook(engine.operation(deadline.remaining()));
       if (target.app.base === undefined || !engine.session.verbs.has('navigate')) return;
-      await openAt(target.app.base.href, deadline.remaining());
+      await openAt(resolveNavigationUrl(target.app.base.href, target.app.base).url, deadline.remaining());
     });
 
   /**

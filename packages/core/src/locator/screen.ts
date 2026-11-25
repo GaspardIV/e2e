@@ -7,7 +7,7 @@ import type { LocatorAction, LocatorExpression, Observation, SemanticNode } from
 import { locatorBrand } from '../internal/brands.ts';
 import { isSecret } from '../secrets.ts';
 import { TestError } from '../internal/errors.ts';
-import { requireFinitePoint } from '../internal/geometry.ts';
+import { isPercentage, requireFinitePoint } from '../internal/geometry.ts';
 import { isCheckable, isValueControl } from '../internal/roles.ts';
 import { isPlainObject, rejectUnknownOptions } from '../internal/options.ts';
 import { realmSlot } from '../internal/realm-slot.ts';
@@ -16,6 +16,7 @@ import { isTextMatch, normalizeText } from '../internal/text.ts';
 import type {
   ActionOptions,
   ClickOptions,
+  FilePayload,
   LongPressOptions,
   Locator,
   Momentum,
@@ -25,6 +26,8 @@ import type {
   RoleAlias,
   RoleOptions,
   Screen,
+  ScreenCoordinate,
+  ScreenPoint,
   ScrollDirection,
   Secret,
   SelectOption,
@@ -46,7 +49,9 @@ import {
 } from './expression.ts';
 import { type Deadline, isOperationTimeout, POLL_INTERVAL_MS, pollReads } from '../internal/time.ts';
 import { SampleHistory } from '../expect/samples.ts';
+import type { ArtifactSink } from '../run/fixtures.ts';
 import type { ScreenshotContext } from '../run/screenshots.ts';
+import { captureMatch } from './element-screenshot.ts';
 
 export interface SecretResolver {
   /**
@@ -60,6 +65,8 @@ export interface ScreenContext {
   readonly engine: LocatorEngine;
   readonly steps: StepRecorder;
   readonly secrets: SecretResolver;
+  /** Where `locator.screenshot()` keeps its file, and how it joins the report. */
+  readonly artifacts: ArtifactSink;
   /** Base directory for resolving relative file paths, e.g. uploads. */
   readonly projectRoot?: string;
   /** Where `toHaveScreenshot` keeps screenshots; absent outside a test. */
@@ -138,6 +145,8 @@ const WAIT_FOR_STATES: readonly string[] = ['attached', 'detached', 'visible', '
 const ABSENCE_STATES: ReadonlySet<string> = new Set(['detached', 'hidden']);
 
 type WaitForState = NonNullable<NonNullable<Parameters<Locator['waitFor']>[0]>['state']>;
+/** The actions a tap, click, double tap, or secondary tap sends. */
+type TapAction = Extract<LocatorAction, { kind: 'tap' | 'doubleTap' | 'secondaryTap' | 'multiTap' }>;
 
 /**
  * Whether the one match, or its absence, is in `state`: `attached` is any
@@ -213,17 +222,17 @@ class ScreenImpl implements Screen {
     return new LocatorImpl(this.context, this.build(testIdQuery(id, options, this.scope)));
   }
 
-  async tapAt(point: Point, options?: ActionOptions): Promise<void> {
+  async tapAt(point: ScreenPoint, options?: ActionOptions): Promise<void> {
     rejectUnknownOptions('tapAt', options, ['timeout']);
-    const at = requirePoint(point, 'tapAt');
+    const at = requireScreenPoint(point, 'tapAt');
     await this.context.steps.run('screen', 'screen.tapAt', describePoint(at), () =>
       this.context.engine.performAt(at, { kind: 'tap' }, options?.timeout),
     );
   }
 
-  async doubleTapAt(point: Point, options?: ActionOptions): Promise<void> {
+  async doubleTapAt(point: ScreenPoint, options?: ActionOptions): Promise<void> {
     rejectUnknownOptions('doubleTapAt', options, ['timeout']);
-    const at = requirePoint(point, 'doubleTapAt');
+    const at = requireScreenPoint(point, 'doubleTapAt');
     await this.context.steps.run('screen', 'screen.doubleTapAt', describePoint(at), () =>
       this.context.engine.performAt(at, { kind: 'doubleTap' }, options?.timeout),
     );
@@ -232,8 +241,8 @@ class ScreenImpl implements Screen {
   async swipe(options: SwipeOptions | SwipePathOptions): Promise<void> {
     if (isSwipePath(options)) {
       rejectUnknownOptions('swipe', options, ['from', 'to', 'duration']);
-      const from = requirePoint(options.from, 'swipe from');
-      const to = requirePoint(options.to, 'swipe to');
+      const from = requireScreenPoint(options.from, 'swipe from');
+      const to = requireScreenPoint(options.to, 'swipe to');
       const durationMs = validateSwipeDuration(options.duration);
       await this.context.steps.run(
         'screen',
@@ -278,10 +287,9 @@ class ScreenImpl implements Screen {
     const label = describeExpression(internals.expression);
     await this.context.steps.run('screen', 'screen.scrollUntilVisible', label, async () => {
       const deadline = engine.deadline(options?.timeout ?? 30_000);
-      const startedMs = Date.now();
       const notVisible = (cause?: unknown) =>
         new TestError('LOCATOR_NOT_FOUND', `target did not become visible while scrolling: ${label}`, {
-          details: locatorDetails(internals.expression, Date.now() - startedMs),
+          details: locatorDetails(internals.expression, deadline.elapsed()),
           ...(cause === undefined ? {} : { cause }),
         });
       const reads = engine.reads(deadline);
@@ -319,6 +327,18 @@ class ScreenImpl implements Screen {
 
   async debug(options?: ActionOptions): Promise<void> {
     console.log(await this.readTree('screen.debug', options));
+  }
+
+  /** Pauses the test. Call it on `screen`, since a pause affects the whole test. */
+  async pause(): Promise<void> {
+    if (this.scope !== undefined || this.wrap !== undefined) {
+      throw new TestError(
+        'INVALID_ARGUMENT',
+        'you can\'t call pause() on a locator or a frame, since a pause stops the whole test; call screen.pause()',
+      );
+    }
+
+    await this.context.steps.pause();
   }
 
   /** One observation of the whole screen, rendered; a locator or a frame refuses, since the tree is not scoped. */
@@ -397,13 +417,23 @@ class LocatorImpl extends ScreenImpl implements Locator {
   }
 
   /**
-   * One tap of the node: the platform's own, or, with a position, the pointer
-   * dispatched at that offset of the node's box.
+   * `count` taps of the node: the platform's own, or, with a position, the
+   * pointer dispatched at that offset of the node's box. Two taps are the
+   * `doubleTap` kind, so `tap({ count: 2 })` is `doubleTap()` on every
+   * engine; three or more are `multiTap`.
    */
   private tapWith(api: 'tap' | 'click', options: TapOptions | undefined): Promise<void> {
-    rejectUnknownOptions(api, options, ['timeout', 'position', 'modifiers']);
+    rejectUnknownOptions(api, options, ['timeout', 'position', 'modifiers', 'count']);
     const modifiers = requireModifiers(options?.modifiers, api);
-    if (options?.position === undefined) return this.dispatchTap(api, 'tap', modifiers, options?.timeout);
+    const count = requireTapCount(options?.count, api);
+    if (options?.position === undefined) {
+      if (count === 1) return this.dispatchTap(api, { kind: 'tap', ...modifiers }, options?.timeout);
+      if (count === 2) return this.dispatchTap(api, { kind: 'doubleTap', ...modifiers }, options?.timeout, count);
+      return this.dispatchTap(api, { kind: 'multiTap', count, ...modifiers }, options?.timeout, count);
+    }
+    if (count !== 1) {
+      throw new TestError('INVALID_ARGUMENT', `${api}() does not take count with a position yet; drop one of them`);
+    }
     if (modifiers.modifiers !== undefined) {
       throw new TestError('INVALID_ARGUMENT', `${api}() does not take modifiers with a position yet; drop one of them`);
     }
@@ -435,19 +465,18 @@ class LocatorImpl extends ScreenImpl implements Locator {
     options: ClickOptions | undefined,
   ): Promise<void> {
     rejectUnknownOptions(api, options, ['timeout', 'modifiers']);
-    return this.dispatchTap(api, kind, requireModifiers(options?.modifiers, api), options?.timeout);
+    return this.dispatchTap(api, { kind, ...requireModifiers(options?.modifiers, api) }, options?.timeout);
   }
 
-  /** One tap kind with the keys it holds, named after the node in the step label. */
-  private dispatchTap(
-    api: string,
-    kind: 'tap' | 'doubleTap' | 'secondaryTap',
-    held: { modifiers?: readonly KeyModifier[] },
-    timeout: number | undefined,
-  ): Promise<void> {
-    const label = held.modifiers === undefined ? this.label : `${this.label} with ${held.modifiers.join('+')}`;
-    return this.context.steps.run('locator', `locator.${api}`, label, () =>
-      this.context.engine.perform(this.expression, { kind, ...held }, timeout),
+  /**
+   * One tap-family action as a step labelled after the node, then the
+   * `count` the caller asked for when it names one, then the keys held.
+   */
+  private dispatchTap(api: string, action: TapAction, timeout: number | undefined, count?: number): Promise<void> {
+    const times = count === undefined ? '' : ` ${count} times`;
+    const held = action.modifiers === undefined ? '' : ` with ${action.modifiers.join('+')}`;
+    return this.context.steps.run('locator', `locator.${api}`, `${this.label}${times}${held}`, () =>
+      this.context.engine.perform(this.expression, action, timeout),
     );
   }
 
@@ -519,18 +548,47 @@ class LocatorImpl extends ScreenImpl implements Locator {
     return this.perform('focus', { kind: 'focus' }, options);
   }
 
+  /** Removes focus from the matched node. */
+  blur(options?: ActionOptions): Promise<void> {
+    return this.perform('blur', { kind: 'blur' }, options);
+  }
+
   hover(options?: ActionOptions): Promise<void> {
     return this.perform('hover', { kind: 'hover' }, options);
   }
 
-  setInputFiles(paths: string | readonly string[], options?: ActionOptions): Promise<void> {
-    const list = typeof paths === 'string' ? [paths] : [...paths];
-    if (list.some((entry) => typeof entry !== 'string' || entry.trim() === '')) {
-      throw new TestError('INVALID_ARGUMENT', 'setInputFiles paths must be non-empty strings');
+  setInputFiles(files: string | readonly string[] | FilePayload | readonly FilePayload[], options?: ActionOptions): Promise<void> {
+    const list: readonly unknown[] = Array.isArray(files) ? [...files] : [files];
+    if (list.some((entry) => typeof entry === 'string') && list.some(isPlainObject)) {
+      throw new TestError('INVALID_ARGUMENT', 'File paths cannot be mixed with buffers');
     }
-    const base = this.context.projectRoot;
-    const resolved = list.map((entry) => (base === undefined ? entry : nodePath.resolve(base, entry)));
-    return this.perform('setInputFiles', { kind: 'setInputFiles', paths: resolved }, options);
+    if (list.length === 0 && !this.context.engine.supports('setInputFiles') &&
+        this.context.engine.supports('setInputFilePayloads')) {
+      return this.perform('setInputFiles', { kind: 'setInputFilePayloads', files: [] }, options);
+    }
+    if (list.length === 0 || typeof list[0] === 'string') {
+      const base = this.context.projectRoot;
+      const paths = list.map((entry) => {
+        if (typeof entry !== 'string' || entry.trim() === '') {
+          throw new TestError('INVALID_ARGUMENT', 'setInputFiles paths must be non-empty strings');
+        }
+        return base === undefined ? entry : nodePath.resolve(base, entry);
+      });
+      return this.perform('setInputFiles', { kind: 'setInputFiles', paths }, options);
+    }
+    const payloads = list.map((entry) => {
+      if (!isPlainObject(entry) || typeof entry['name'] !== 'string' || entry['name'].trim() === '' ||
+          typeof entry['mimeType'] !== 'string' || !Buffer.isBuffer(entry['buffer'])) {
+        throw new TestError('INVALID_ARGUMENT', 'setInputFiles payloads require a non-empty name, a mimeType string, and a Buffer');
+      }
+      rejectUnknownOptions('setInputFiles payload', entry, ['name', 'mimeType', 'buffer']);
+      return { name: entry['name'], mimeType: entry['mimeType'], buffer: entry['buffer'] };
+    });
+    if (payloads.reduce((size, file) => size + file.buffer.byteLength, 0) >= 50 * 1024 * 1024) {
+      throw new TestError('INVALID_ARGUMENT', 'Cannot set buffer larger than 50Mb, please write it to a file and pass its path instead.');
+    }
+    const snapshots = payloads.map((file) => ({ ...file, buffer: new Uint8Array(file.buffer) }));
+    return this.perform('setInputFiles', { kind: 'setInputFilePayloads', files: snapshots }, options);
   }
 
   dragTo(target: Locator, options?: ActionOptions): Promise<void> {
@@ -608,6 +666,18 @@ class LocatorImpl extends ScreenImpl implements Locator {
     return node.rect ?? null;
   }
 
+  screenshot(label?: string): Promise<string> {
+    if (label !== undefined && typeof label !== 'string') {
+      throw new TestError('INVALID_ARGUMENT', `locator.screenshot() takes a label for the file's name, got ${describeValue(label)}; the file is saved with the attempt's artifacts and its path is returned`);
+    }
+    const { artifacts, engine, steps } = this.context;
+    return steps.run('locator', 'locator.screenshot', label === undefined ? this.label : `${this.label} → ${label}`, async () => {
+      const relative = await captureMatch(engine, artifacts.dir, this.expression, label);
+      steps.attachArtifact(artifacts.register('screenshot', relative));
+      return nodePath.join(artifacts.dir, relative);
+    });
+  }
+
   async count(): Promise<number> {
     const refs = await this.context.engine.resolveNow(this.expression);
     return refs.length;
@@ -636,7 +706,6 @@ class LocatorImpl extends ScreenImpl implements Locator {
     await this.context.steps.run('locator', 'locator.waitFor', `${this.label} → ${state}`, async () => {
       const { engine } = this.context;
       const deadline = engine.deadline(options?.timeout);
-      const startedMs = Date.now();
       const samples = new SampleHistory('waitFor', (text) => engine.redact(text));
       await samples.record(engine, () =>
         pollReads({
@@ -651,7 +720,7 @@ class LocatorImpl extends ScreenImpl implements Locator {
           },
           onTimeout: (cause) =>
             new TestError('LOCATOR_NOT_FOUND', `locator did not become ${state}: ${this.label}`, {
-              details: locatorDetails(this.expression, Date.now() - startedMs),
+              details: locatorDetails(this.expression, deadline.elapsed()),
               ...(cause === undefined ? {} : { cause }),
             }),
         }),
@@ -714,6 +783,27 @@ function requirePoint(point: Point | undefined, what: string): Point {
   return at;
 }
 
+/** Validates a viewport point a test names: non-negative pixels or `'0%'` through `'100%'` per coordinate. */
+function requireScreenPoint(point: ScreenPoint | undefined, what: string): ScreenPoint {
+  const { x, y } = (point ?? {}) as { readonly x?: unknown; readonly y?: unknown };
+  return { x: requireCoordinate(x, what), y: requireCoordinate(y, what) };
+}
+
+/** One coordinate of `requireScreenPoint`. */
+function requireCoordinate(value: unknown, what: string): ScreenCoordinate {
+  if (isPercentage(value)) return value;
+  if (typeof value === 'string') {
+    throw new TestError('INVALID_ARGUMENT', `${what} takes a percentage from '0%' through '100%', got ${JSON.stringify(value)}`);
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TestError('INVALID_ARGUMENT', `${what} requires a point { x, y } of finite numbers or percentages`);
+  }
+  if (value < 0) {
+    throw new TestError('INVALID_ARGUMENT', `${what} requires a point { x, y } of non-negative numbers`);
+  }
+  return value;
+}
+
 /**
  * Refuses a `selectOption` value that is not one option: a label string or an
  * object with exactly one of `label`, `value`, or a nonnegative integer
@@ -740,7 +830,7 @@ function requireSelectOption(value: unknown): void {
 }
 
 /** A point as the report shows it. */
-function describePoint(point: Point): string {
+function describePoint(point: ScreenPoint): string {
   return `(${point.x}, ${point.y})`;
 }
 
@@ -775,6 +865,15 @@ function validateSwipeDuration(duration: number | undefined): number | undefined
     );
   }
   return duration;
+}
+
+/** A tap `count`: a positive safe integer, 1 when unset. Each engine keeps its own upper limit. */
+function requireTapCount(value: unknown, api: string): number {
+  if (value === undefined) return 1;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new TestError('INVALID_ARGUMENT', `${api}() count must be a positive safe integer, got ${describeValue(value)}`);
+  }
+  return value;
 }
 
 /**

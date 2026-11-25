@@ -8,7 +8,9 @@ import {
   type OperationContext,
   type PointerAction,
   type SemanticNode,
+  type ViewportIntersection,
   type ViewportPoint,
+  type ViewportSize,
 } from '../engine/surface.ts';
 import {
   asEngineError,
@@ -20,13 +22,24 @@ import {
   type ErrorDetails,
 } from '../internal/errors.ts';
 import { requireKey } from '../internal/keys.ts';
+import { isPixelPoint, resolveScreenPoint } from '../internal/geometry.ts';
 import { describeExpression, expressionHints, filterSpine } from './expression.ts';
-import { abortError, cancelledError, Deadline, POLL_INTERVAL_MS, pollDelay, ReadWindow, sleep, stepTimeout } from '../internal/time.ts';
+import { abortError, cancelledError, Deadline, POLL_INTERVAL_MS, pollDelay, pollReads, ReadWindow, sleep, StepDeadline, stepTimeout } from '../internal/time.ts';
 import { timestamp } from '../internal/ids.ts';
 import { obj } from '../internal/objects.ts';
 import { targetLabel } from '../cache/trace.ts';
 import type { AttemptBudget } from '../run/budget.ts';
 import type { StepEvent } from '../run/steps.ts';
+import type { ScreenPoint } from '../types.ts';
+
+/** A pointer action as a test names it: its `target`, if any, may be a percentage of the viewport. */
+type ScreenPointerAction = WithScreenTarget<PointerAction>;
+
+/** Each action in the union, with `target` typed as a `ScreenPoint`. */
+type WithScreenTarget<A> = { readonly [K in keyof A]: K extends 'target' ? ScreenPoint : A[K] };
+
+/** A tuple of `ScreenPoint`s, each resolved to CSS pixels. */
+type InPixels<P extends readonly ScreenPoint[]> = { readonly [K in keyof P]: ViewportPoint };
 
 /** Canonical visibility predicate over a semantic node snapshot. */
 export function isNodeVisible(node: SemanticNode | null): node is SemanticNode {
@@ -73,7 +86,7 @@ const STEP_COUNT_BUDGET_MS = 500;
 interface LocatorEngineOptions {
   readonly session: TargetSession;
   /** The running phase's signal and deadline, read per operation. */
-  readonly budget: AttemptBudget;
+  readonly budget: Pick<AttemptBudget, 'signal' | 'deadline'>;
   readonly runId: string;
   readonly attemptId: string;
   readonly actionTimeout: number;
@@ -163,13 +176,13 @@ export class LocatorEngine {
    * capped by the running phase's deadline. 0 sets no deadline of its own,
    * so the phase's alone bounds it.
    */
-  deadline(timeoutMs?: number): Deadline {
+  deadline(timeoutMs?: number): StepDeadline {
     return this.capped(stepTimeout(timeoutMs, 'the step'));
   }
 
   /** A deadline `timeoutMs` (default the action timeout) from now, capped by the running phase's deadline. */
-  private capped(timeoutMs: number | undefined): Deadline {
-    return Deadline.min(new Deadline(timeoutMs ?? this.options.actionTimeout), this.options.budget.deadline);
+  private capped(timeoutMs: number | undefined): StepDeadline {
+    return new StepDeadline(timeoutMs ?? this.options.actionTimeout, this.options.budget.deadline);
   }
 
   /** An operation context bounded by a deadline a caller shares across steps, such as the swipes of one scroll. */
@@ -200,6 +213,14 @@ export class LocatorEngine {
    */
   private checkAction(action: LocatorAction): void {
     if (!this.session.actions.has(action.kind)) {
+      if (action.kind === 'setInputFilePayloads') {
+        throw new ConfigurationError(
+          'UNSUPPORTED_CAPABILITY',
+          `in-memory files for setInputFiles are not available on this target; update its engine${
+            this.session.actions.has('setInputFiles') ? ' or pass a file path' : ''
+          }`,
+        );
+      }
       throw new ConfigurationError(
         'UNSUPPORTED_CAPABILITY',
         `the "${action.kind}" action is not available on this target: its engine declares ${
@@ -217,7 +238,7 @@ export class LocatorEngine {
   }
 
   /** Refuses a pointer action the session would refuse: an undeclared kind is `UNSUPPORTED_CAPABILITY`. */
-  private checkPointerAction(action: PointerAction): void {
+  private checkPointerAction(action: Pick<PointerAction, 'kind'>): void {
     if (!this.session.pointerActions.has(action.kind)) {
       throw new ConfigurationError(
         'UNSUPPORTED_CAPABILITY',
@@ -254,7 +275,8 @@ export class LocatorEngine {
           if (missingFrame === 'empty' && engineError.code === 'FRAME_NOT_FOUND') return [];
           if (!reads.deadline.expired()) {
             retried = cause;
-            await sleep(pollDelay(Date.now() - startedMs), this.signal);
+            const now = Date.now();
+            await sleep(Math.min(pollDelay(now - startedMs), reads.deadline.remaining(now)), this.signal);
             continue;
           }
         }
@@ -279,8 +301,10 @@ export class LocatorEngine {
     // budget waited less than the action timeout, and the report says so.
     const notFound = async (cause?: unknown) => {
       // The wait as it happened, read before the diagnostic pass runs: the
-      // prefix resolves below are not part of the locator's wait.
-      const waitedMs = Date.now() - startedMs;
+      // prefix resolves below are not part of the locator's wait. A step's
+      // deadline counts it from the step's start; a deadline borrowed from
+      // elsewhere, such as an assertion's, has only this resolve's.
+      const waitedMs = deadline instanceof StepDeadline ? deadline.elapsed() : Date.now() - startedMs;
       const lines = await this.candidateCounts(expression);
       return new TestError('LOCATOR_NOT_FOUND', `locator matched no nodes within ${describeExpression(expression)}${lines}`, {
         details: locatorDetails(expression, waitedMs),
@@ -421,7 +445,41 @@ if (sampled && reads.cutOff(cause)) throw await notFound(cause);
     reads: ReadWindow,
     missingFrame: MissingFrame = 'wait',
   ): Promise<{ node: SemanticNode | null; count: number }> {
-    return this.readOne(expression, reads, missingFrame);
+    const { node, count } = await this.readOne(expression, reads, missingFrame);
+    return { node, count };
+  }
+
+  /**
+   * Reads the one current match and measures how much of it is inside the
+   * viewport, for `toBeInViewport`: one resolve, one read from it, and one
+   * measure of the same ref, all inside `reads`, never a second observation.
+   * Zero matches or a missing frame read as no node. A ref that went stale
+   * before it was read or measured is `stale`, so the poll samples again
+   * instead of reading the node as gone. An engine that cannot measure is
+   * refused before the resolve, so a missing match never hides it.
+   */
+  async readViewport(
+    expression: LocatorExpression,
+    reads: ReadWindow,
+  ): Promise<{ node: SemanticNode | null; count: number; stale: boolean; intersection?: ViewportIntersection }> {
+    if (!this.session.measuresViewport) {
+      throw new ConfigurationError(
+        'UNSUPPORTED_CAPABILITY',
+        'toBeInViewport is not available on this target: its engine does not implement viewportIntersection',
+      );
+    }
+    const { node, count, stale } = await this.readOne(expression, reads, 'empty');
+    if (stale) return { node: null, count: 1, stale };
+    if (node === null) return { node, count, stale };
+    try {
+      const intersection = await reads.read((timeoutMs) =>
+        this.session.viewportIntersection(node.ref, this.readOperation(timeoutMs)),
+      );
+      return { node, count, stale, intersection };
+    } catch (cause) {
+      if (asEngineError(cause)?.code === 'NODE_STALE') return { node, count, stale: true };
+      throw translateLocatorError(cause, expression);
+    }
   }
 
   /**
@@ -434,19 +492,24 @@ if (sampled && reads.cutOff(cause)) throw await notFound(cause);
     return node;
   }
 
+  /**
+   * Resolves and reads the one current match. A ref superseded between the
+   * resolve and the read is no node with `stale` set: most callers read it as
+   * gone, and `readViewport` samples again.
+   */
   private async readOne(
     expression: LocatorExpression,
     reads: ReadWindow,
     missingFrame: MissingFrame,
-  ): Promise<{ node: SemanticNode | null; count: number }> {
+  ): Promise<{ node: SemanticNode | null; count: number; stale: boolean }> {
 const ref = await this.singleOf(await this.resolveOnce(expression, reads, missingFrame), expression);
-    if (ref === null) return { node: null, count: 0 };
+    if (ref === null) return { node: null, count: 0, stale: false };
     try {
       const node = await reads.read((timeoutMs) => this.session.read(ref, this.readOperation(timeoutMs)));
-      return { node, count: 1 };
+      return { node, count: 1, stale: false };
     } catch (cause) {
       if (asEngineError(cause)?.code === 'NODE_STALE') {
-        return { node: null, count: 0 };
+        return { node: null, count: 0, stale: true };
       }
       throw translateLocatorError(cause, expression);
     }
@@ -464,6 +527,11 @@ const ref = await this.singleOf(await this.resolveOnce(expression, reads, missin
     timeoutMs?: number,
   ): Promise<void> {
     await this.performUntil(expression, action, this.deadline(timeoutMs));
+  }
+
+  /** Reports whether the target engine declares this locator action. */
+  supports(kind: LocatorAction['kind']): boolean {
+    return this.session.actions.has(kind);
   }
 
   /**
@@ -494,9 +562,29 @@ const ref = await this.singleOf(await this.resolveOnce(expression, reads, missin
   }
 
   /** Performs one pointer action at a viewport point, with no node behind it. */
-  async performAt(point: ViewportPoint, action: PointerAction, timeoutMs?: number): Promise<void> {
+  async performAt(point: ScreenPoint, action: ScreenPointerAction, timeoutMs?: number): Promise<void> {
     this.checkPointerAction(action);
-    await this.dispatchAt(point, action, this.deadline(timeoutMs));
+    const deadline = this.deadline(timeoutMs);
+
+    if (!('target' in action)) {
+      const [at] = await this.inPixels([point], deadline);
+      await this.dispatchAt(at, action, deadline);
+      return;
+    }
+    const [from, to] = await this.inPixels([point, action.target], deadline);
+    await this.dispatchAt(from, { ...action, target: to }, deadline);
+  }
+
+  /** The points in CSS pixels, with one viewport read if any of them is a percentage. */
+  private async inPixels<const P extends readonly ScreenPoint[]>(points: P, deadline: Deadline): Promise<InPixels<P>> {
+    if (points.every(isPixelPoint)) return points as InPixels<P>;
+    const viewport = await this.viewport(deadline);
+    return points.map((point) => resolveScreenPoint(point, viewport)) as InPixels<P>;
+  }
+
+  /** The viewport size, read from one screen observation. */
+  private async viewport(deadline: Deadline): Promise<ViewportSize> {
+    return (await this.session.observe(this.operationWithin(deadline))).viewport;
   }
 
   /**
@@ -515,35 +603,38 @@ const ref = await this.singleOf(await this.resolveOnce(expression, reads, missin
   ): Promise<void> {
     this.checkPointerAction(action);
     const deadline = this.deadline(timeoutMs);
-    const startedMs = Date.now();
     if (this.session.actions.has('scrollIntoView')) {
       await this.performUntil(expression, { kind: 'scrollIntoView' }, deadline);
     }
-    const notVisible = (cause?: unknown) =>
-      new TestError('LOCATOR_NOT_FOUND', `locator did not become visible with a box to act within: ${describeExpression(expression)}`, {
-        details: locatorDetails(expression, Date.now() - startedMs),
-        ...(cause === undefined ? {} : { cause }),
-      });
-    const reads = this.reads(deadline);
-    const pollStartedMs = Date.now();
-    let sampled = false;
-    for (;;) {
-      let node: SemanticNode | null;
-      try {
-        ({ node } = await this.tryRead(expression, reads));
-      } catch (cause) {
-        if (sampled && reads.cutOff(cause)) throw notVisible(cause);
-        throw cause;
-      }
-      sampled = true;
-      if (isNodeVisible(node) && node.rect !== undefined) {
-        const origin = node.origin ?? node.rect;
-        await this.dispatchAt({ x: origin.x + offset.x, y: origin.y + offset.y }, action, deadline);
-        return;
-      }
-      if (deadline.expired()) throw notVisible();
-      await sleep(pollDelay(Date.now() - pollStartedMs), this.signal);
-    }
+    let origin: ViewportPoint | undefined;
+    await pollReads({
+      deadline,
+      signal: this.signal,
+      negated: false,
+      reads: this.reads(deadline),
+      evaluate: async (reads) => {
+        // A box read at the deadline could never be tapped: skip the read so the wait ends as LOCATOR_NOT_FOUND.
+        if (deadline.expired()) return false;
+        const { node } = await this.tryRead(expression, reads);
+        if (!isNodeVisible(node) || node.rect === undefined) return false;
+        origin = node.origin ?? node.rect;
+        return true;
+      },
+      onTimeout: (cause) =>
+        new TestError('LOCATOR_NOT_FOUND', `locator did not become visible with a box to act within: ${describeExpression(expression)}`, {
+          details: locatorDetails(expression, deadline.elapsed()),
+          ...(cause === undefined ? {} : { cause }),
+        }),
+    });
+    // pollReads returns only once `evaluate` answered true, which set `origin`.
+    const at = origin!;
+    await this.dispatchAt({ x: at.x + offset.x, y: at.y + offset.y }, action, deadline);
+  }
+
+  /** The failure of an action that was not sent: its phase was cancelled, or its deadline passed first. */
+  private lateAction(kind: string, target: string): Error & { readonly code: string } {
+    if (!this.signal.aborted) return lateAction(kind, target);
+    return isE2EError(this.signal.reason) ? this.signal.reason : cancelledError();
   }
 
   /** One pointer dispatch within a deadline, its engine error translated to the public taxonomy. */
@@ -561,8 +652,8 @@ const ref = await this.singleOf(await this.resolveOnce(expression, reads, missin
         detail: `${action.kind} at (${Math.round(point.x)}, ${Math.round(point.y)})`,
       });
     if (deadline.expired()) {
-      const failure = lateAction(action.kind, `(${Math.round(point.x)}, ${Math.round(point.y)})`);
-      record('failed', failure.code);
+      const failure = this.lateAction(action.kind, `(${Math.round(point.x)}, ${Math.round(point.y)})`);
+      record(this.signal.aborted ? 'cancelled' : 'failed', failure.code);
       throw failure;
     }
     try {
@@ -645,8 +736,8 @@ const ref = await this.singleOf(await this.resolveOnce(expression, reads, missin
       const record = (status: StepEvent['status'], code?: string): void =>
         this.recordAction({ node, kind: resolved.kind, startedAt, startedMs, waitedMs, stale, status, code });
       if (deadline.expired()) {
-        const failure = lateAction(resolved.kind, describeExpression(expression));
-        record('failed', failure.code);
+        const failure = this.lateAction(resolved.kind, describeExpression(expression));
+        record(this.signal.aborted ? 'cancelled' : 'failed', failure.code);
         throw failure;
       }
       try {

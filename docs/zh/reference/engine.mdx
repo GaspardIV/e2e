@@ -13,7 +13,9 @@ description: 通过观察、操作、生命周期钩子和测试夹具构建引�
 import { defineEngine, resolveExpression, type EngineHandle } from 'e2e/engine';
 import { connect } from './client.ts';
 
-export function kiosk(options: { host: string }): EngineHandle {
+export interface KioskEngine extends EngineHandle {}
+
+export function kiosk(options: { host: string }): KioskEngine {
   const client = connect(options.host);
   return defineEngine({
     name: 'kiosk',
@@ -72,6 +74,8 @@ export interface EngineHandle<Fixtures extends object = {}> extends Engine {
 
 `Fixtures` 定义引擎的 [`fixtures`](#contributed-fixtures) 所提供的测试夹具类型，例如 `{ browser: Browser }`。对于其中声明的每个测试夹具，编译器都要求 `fixtures` 中存在返回该测试夹具的工厂；`screen`、`app` 和 `platform` 不需要，因为每个会话都包含它们。运行时不会检查这一点。有了它，[`@e2e-dev/core`](/core) 的 `launch` 无需手写类型参数就能推导会话的测试夹具类型：从工厂返回 `defineEngine<{ device: Device }>(...)` 即可。
 
+请像上面的 `KioskEngine` 一样，从工厂返回自己的接口。这样，推导类型的配置文件就能通过你的包名引用该类型。如果直接返回 `EngineHandle`，设置了 `declaration: true` 的 pnpm 项目可能会因 TS2883 报错。
+
 当规范违反以下任一规则时，`defineEngine` 会抛出 `INVALID_CONFIG`：
 
 | 成员 | 拒绝条件 |
@@ -85,9 +89,12 @@ export interface EngineHandle<Fixtures extends object = {}> extends Engine {
 | `observe`、`readStyle`、`locate`、`perform`、`performAt`、`prepare`、`finish`、`doctor`、`init`、`startAttempt`、`settleAttempt`、`endAttempt`、`dispose`、`validateApp` | 不是函数。 |
 | 任何其他顶层键 | 对象字面量中出现此类键，包括 `app`：应在测试目标上声明应用，并在 `validateApp` 中检查。不会检查类实例的自有字段。 |
 | `readStyle`、`perform`、`locate`、`performAt`、`keyboard` | 已声明，但未声明 `observe`。 |
-| `perform`、`actions` | 只声明了其中一个。`actions` 列表为空、包含重复的种类，或指定了 `LOCATOR_ACTION_KINDS` 之外的种类。 |
+| `perform`、`actions` | 只声明了其中一个。`actions` 列表为空、包含重复的种类，或指定了 `KNOWN_LOCATOR_ACTION_KINDS` 之外的种类。 |
 | `performAt`、`pointerActions` | 只声明了其中一个。`pointerActions` 列表为空、包含重复的种类，或指定了 `POINTER_ACTION_KINDS` 之外的种类。 |
 | `tapModifiers` | 不是布尔值，或设为 `true` 但未声明 `perform`。 |
+| `selectsDevice` | 不是布尔值，或设为 `true` 但未声明 `prepare`。 |
+| `grantsAllPermissions` | 不是布尔值。 |
+| `isolation` | 不是 `'attempt'` 或 `'worker'`。 |
 | `keyboard`、`state`、`artifacts`、`session` | 包含未知键或非函数成员。`keyboard` 缺少 `type` 和 `press`；`state` 未同时包含 `capture` 和 `restore`；`artifacts` 缺少 `screenshot`；声明了 `startVideo` 却没有 `stopVideo`，或反之。 |
 | `secrets` | 不是由 `secrets.get()` 句柄组成的数组。 |
 | `fixtures` | 不是对象，某个测试夹具不是工厂函数，或测试夹具名称不是小驼峰标识符，或遮蔽了 `agent`、`app`、`screen`、`platform`、`session`。 |
@@ -113,8 +120,11 @@ export interface EngineHandle<Fixtures extends object = {}> extends Engine {
 | [`locate`](#capabilities) | 方法 |
 | [`performAt`、`pointerActions`](#pointer-actions) | 方法、种类 |
 | [`tapModifiers`](#capabilities) | `boolean` |
+| [`selectsDevice`](#capabilities) | `boolean` |
+| [`grantsAllPermissions`](#capabilities) | `boolean` |
 | [`keyboard`](#keyboard) | `EngineKeyboard` |
 | [`fixtures`](#contributed-fixtures) | 工厂 |
+| [`isolation`](#fixture-isolation) | `'attempt' \| 'worker'` |
 | [`state`](#state) | `EngineStateCapability` |
 | [`artifacts`](#artifacts) | `EngineArtifacts` |
 | [`validateApp`](#app) | 方法 |
@@ -207,20 +217,43 @@ export interface Engine {
    */
   readonly pointerActions?: readonly PointerActionKind[];
   /**
-   * The surface honors `modifiers` on the `tap`, `doubleTap`, and
-   * `secondaryTap` actions `perform` receives. Without it the harness fails
+   * The surface honors `modifiers` on the `tap`, `doubleTap`, `multiTap`,
+   * and `secondaryTap` actions `perform` receives. Without it the harness fails
    * an action that carries modifiers with `UNSUPPORTED_CAPABILITY` before it
    * reaches the engine.
    */
   readonly tapModifiers?: boolean;
+  /**
+   * `prepare` binds the target to the device `EnginePrepareInfo.device`
+   * names, for `e2e run --device`. Without it the runner refuses the flag
+   * for the target before anything is prepared.
+   */
+  readonly selectsDevice?: boolean;
+  /**
+   * The engine grants `app.permissions: 'all'`, which reaches it as
+   * `EngineAppInfo.allPermissions`. Without it the harness refuses `'all'` at
+   * config load, so an engine that predates the value never receives it.
+   */
+  readonly grantsAllPermissions?: boolean;
+  /**
+   * The engine reads the object form of `app.launchArguments` from
+   * `EngineAppInfo.launchArgumentValues`. Without it the harness refuses an
+   * object at config load.
+   */
+  readonly launchArgumentValues?: boolean;
   /** capability: keyboard - requires observation. Input to whatever holds focus; see `EngineKeyboard`. */
   readonly keyboard?: EngineKeyboard;
   /**
    * Named deterministic surfaces this engine contributes to TestFixtures
    * (a device fixture, a document fixture - anything). Keys become fixture and
-   * capability names; `requires: ['<name>']` gates at selection.
+   * capability names.
    */
   readonly fixtures?: Readonly<Record<string, EngineFixtureFactory>>;
+  /**
+   * How long the state behind this engine's `fixtures`, `app`, and `screen`
+   * lives; see `EngineIsolation`. Defaults to `attempt`.
+   */
+  readonly isolation?: EngineIsolation;
   /** capability: state - opaque snapshot capture/restore for session reuse. */
   readonly state?: EngineStateCapability;
   /** capability: artifacts - screenshots under the attempt directory, and videos there or at a provider. */
@@ -338,9 +371,8 @@ export interface OperationContext {
 
 ### 能力
 
-引擎实现的成员决定其能力。`screen`、`Locator` 或 `app` 调用如果需要某项缺失的能力，会以 `UNSUPPORTED_CAPABILITY` 失败。[测试 API](#test-apis) 列出了各项功能所需的成员。以下三种缺失情况的处理方式不同：
+引擎实现的成员决定其能力。`screen`、`Locator` 或 `app` 调用如果需要某项缺失的能力，会以 `UNSUPPORTED_CAPABILITY` 失败。[测试 API](#test-apis) 列出了各项功能所需的成员。以下两种缺失情况的处理方式不同：
 
-- 如果测试通过 `requires` 声明了引擎没有的测试夹具，该测试会被跳过（`capability-unavailable`）。
 - 如果选中的测试使用 `test.setup` 会话，而引擎没有 `state`，则会在初始化运行前产生收集错误。
 - 如果引擎不支持视频录制，设置 `video` 模式会输出提示，且不会录制视频。
 
@@ -350,7 +382,9 @@ export interface OperationContext {
 | `readStyle` | `computed-style` | `observe` | 供只读项目工具使用的允许列表中的渲染属性。 |
 | `perform` + `actions` | `actions` | `observe` | 已声明种类的节点操作，带有平台可操作性检查。 |
 | `locate` | `location` | `observe` | `screen`、`Locator`、`expect(locator)`。 |
-| `tapModifiers: true` | - | `perform` | `tap`、`doubleTap` 和 `secondaryTap` 的 `modifiers`。 |
+| `tapModifiers: true` | - | `perform` | `tap`、`doubleTap`、`multiTap` 和 `secondaryTap` 的 `modifiers`。 |
+| `selectsDevice: true` | - | `prepare` | `e2e run --device`，由 `prepare` 绑定指定的设备。 |
+| `grantsAllPermissions: true` | - | - | `app.permissions: 'all'`，引擎以 `EngineAppInfo.allPermissions` 接收。未声明时，加载配置会拒绝 `'all'`，因此在此之前发布的引擎不会收到这个字符串。 |
 | `performAt` + `pointerActions` | `pointer` | `observe` | 在视口坐标点上执行一次指针操作，无需对应节点。 |
 | `keyboard.{type,press,dismiss?}` | `keyboard` | `observe` | 向当前焦点所在位置输入。 |
 | `fixtures.<name>` | `<name>` | - | 引擎提供的测试夹具。 |
@@ -431,7 +465,6 @@ export type ComputedStyleValues = Readonly<Partial<Record<ComputedStyleProperty,
 | `app.back()` | `session.back` |
 | `app.restart()` | `session.restart` |
 | `app.clearState()` | `session.reset` |
-| `requires: ['<name>']` | `fixtures.<name>` |
 
 #### `engine.capabilities`
 
@@ -441,8 +474,6 @@ export type ComputedStyleValues = Readonly<Partial<Record<ComputedStyleProperty,
 const engine = kiosk({ host: 'kiosk.local' });
 engine.capabilities.has('location'); // true: the engine implements locate
 ```
-
-测试选择还会根据测试目标声明的应用种类，而非其引擎，对测试目标分类。带有 `app.url` 的测试目标具有 `browser`，带有 `app.bundleId` 或 `app.appPath` 的测试目标具有 `native-app`，因此测试可以声明 `requires: ['native-app']`。
 
 ```ts
 /**
@@ -559,11 +590,21 @@ export interface EnginePrepareResult {
   readonly env?: Readonly<Record<string, string>>;
 }
 
+/** Who holds a target, for the lifecycle hooks: `prepare`, `init`, `finish`. */
+export interface EngineHostIdentity {
+  /**
+   * Set when a `launch()` host holds the target: a token no other host has.
+   * Hosts name their targets alike, so an engine that names what it holds
+   * after the target (a device session) adds this to keep hosts apart.
+   */
+  readonly hostId?: string | undefined;
+}
+
 /**
  * Facts handed to `prepare`, once per run and target in the runner process,
  * before any worker exists.
  */
-export interface EnginePrepareInfo {
+export interface EnginePrepareInfo extends EngineHostIdentity {
   /** The run id. */
   readonly runId: string;
   /** The target being prepared. */
@@ -598,6 +639,12 @@ export interface EnginePrepareInfo {
   /** Whether the run asked for a visible surface (`--headed`), as `EngineInitInfo` declares it. */
   readonly headed: boolean;
   /**
+   * The device `e2e run --device` names for this target, by name or id: the
+   * one to bind instead of the configured one. Only an engine that declares
+   * `selectsDevice` receives it.
+   */
+  readonly device?: string;
+  /**
    * Reports one line of progress. The runner streams it as a `notice` run
    * event, so it reaches the reporter and every host sink instead of being
    * written to a worker's stderr underneath the live status block.
@@ -620,7 +667,7 @@ async finish(info) {
 
 ```ts
 /** Handed to `finish`, once per run and target after the last worker is gone, with the cleanup budget of one hook. */
-export interface EngineFinishInfo extends EngineCleanupContext {
+export interface EngineFinishInfo extends EngineCleanupContext, EngineHostIdentity {
   /** The run id. */
   readonly runId: string;
   /** The target being finished. */
@@ -695,7 +742,7 @@ async init(info) {
 
 ```ts
 /** Run identity and harness-resolved facts handed to `init`, once per worker before the first step. */
-export interface EngineInitInfo {
+export interface EngineInitInfo extends EngineHostIdentity {
   /** The run id. */
   readonly runId: string;
   /** The target this worker serves. */
@@ -978,7 +1025,14 @@ export interface EngineSnapshot {
   readonly treeUnavailable?: true;
   /** Masked pixels, when requested and producible; omitted otherwise. */
   readonly pixels?: ObservationPixels;
-  /** Regions masked in `pixels`; the harness checks it covers every secure node. */
+  /**
+   * Regions masked in the screenshot; the harness checks it covers every secure
+   * node. An engine asked for pixels (`pixels: true`) that cannot mask every
+   * secure node on screen omits `pixels` and still reports the regions it
+   * could mask, fewer than the secure nodes, so `toHaveScreenshot` fails with
+   * `POLICY_DENIED` and the agent reads `MASKING_UNPROVEN`, not a missing
+   * screenshot.
+   */
   readonly maskedRegionCount?: number;
 }
 
@@ -1039,6 +1093,7 @@ return {
 | `check` | - | 是 | - |
 | `uncheck` | - | 是 | - |
 | `focus` | - | 是 | - |
+| `blur` | - | 是 | - |
 | `hover` | - | 是 | 是 |
 | `scrollIntoView` | - | 是 | - |
 | `selectOption` | `value` | 是 | - |
@@ -1080,11 +1135,18 @@ export type LocatorAction =
       readonly modifiers?: readonly KeyModifier[];
     }
   | {
+      /** `count` taps in a row (3 or more; 2 is `doubleTap`): one multi-click in a browser, presses at the device's cadence on a device. */
+      readonly kind: 'multiTap';
+      readonly count: number;
+      readonly modifiers?: readonly KeyModifier[];
+    }
+  | {
       readonly kind:
         | 'check'
         | 'uncheck'
         | 'clear'
         | 'focus'
+        | 'blur'
         | 'hover'
         | 'scrollIntoView';
     }
@@ -1093,6 +1155,11 @@ export type LocatorAction =
   | { readonly kind: 'press'; readonly key: Key }
   | { readonly kind: 'selectOption'; readonly value: SelectOption }
   | { readonly kind: 'setInputFiles'; readonly paths: readonly string[] }
+  | {
+      readonly kind: 'setInputFilePayloads';
+      /** In-memory files; an empty array clears the input. The protocol encodes bytes only on the wire. */
+      readonly files: readonly { readonly name: string; readonly mimeType: string; readonly buffer: Uint8Array }[];
+    }
   | { readonly kind: 'dragTo'; readonly target: NodeRef }
   | {
       readonly kind: 'swipe';
@@ -1103,7 +1170,7 @@ export type LocatorAction =
 /** Every action kind; what an engine declares in `actions`. */
 export type LocatorActionKind = LocatorAction['kind'];
 
-/** The closed list of action kinds, in contract order; the type is derived from it. */
+/** The locator action kinds of SPI v1. List newer kinds explicitly. Use KNOWN_LOCATOR_ACTION_KINDS to check an action kind. */
 export const LOCATOR_ACTION_KINDS = [
   'tap',
   'doubleTap',
@@ -1122,6 +1189,9 @@ export const LOCATOR_ACTION_KINDS = [
   'dragTo',
   'swipe',
 ] as const satisfies readonly LocatorActionKind[];
+
+/** Every action kind understood by this version of core. */
+export const KNOWN_LOCATOR_ACTION_KINDS = [...LOCATOR_ACTION_KINDS, 'blur', 'setInputFilePayloads', 'multiTap'] as const satisfies readonly LocatorActionKind[];
 ```
 
 #### 指针操作
@@ -1287,6 +1357,18 @@ export interface EngineAppCheckInfo {
 
 /** A permission's state when the app launches: held, refused, or not asked for yet, so the OS asks again. */
 export type AppPermissionState = 'grant' | 'deny' | 'reset';
+
+/** One value in the object form of `launchArguments`; the engine spells it for its platform. */
+export type LaunchArgumentValue = string | number | boolean | readonly string[];
+
+/** A target's launch arguments: the strings the launch command takes, or an object of argument name to value. */
+export type LaunchArguments = readonly string[] | Readonly<Record<string, LaunchArgumentValue | undefined>>;
+
+/** The object form after the shape check: the `undefined` entries are gone. */
+export type LaunchArgumentValues = Readonly<Record<string, LaunchArgumentValue>>;
+
+/** Launch arguments after the shape check: a list of strings, or an object. */
+export type ResolvedLaunchArguments = readonly string[] | LaunchArgumentValues;
 ```
 
 #### `EngineAppInfo`
@@ -1322,10 +1404,22 @@ export interface EngineAppInfo {
   readonly bundleId?: string;
   /** The build to install, as the target declared it; relative to `projectRoot`. */
   readonly appPath?: string;
-  /** Arguments every fresh launch passes the app. */
+  /** Arguments every fresh launch passes the app, when the target declared them as a list of strings. */
   readonly launchArguments?: readonly string[];
+  /**
+   * Arguments every fresh launch passes the app, when the target declared
+   * them as an object; only an engine that declares `launchArgumentValues`
+   * receives one.
+   */
+  readonly launchArgumentValues?: LaunchArgumentValues;
   /** Permissions the app holds, by name; what each state means is the engine's (a device sets them before every fresh launch). */
   readonly permissions?: Readonly<Record<string, AppPermissionState>>;
+  /**
+   * `app.permissions: 'all'`: grant every permission the engine can grant,
+   * in place of `permissions`. Only an engine that declares
+   * `grantsAllPermissions` receives it; for any other, the config is refused.
+   */
+  readonly allPermissions?: true;
 }
 ```
 
@@ -1518,6 +1612,8 @@ export class InfrastructureError extends E2EError {
 | [`pollCondition`、`Deadline`](#pollcondition) | `Promise<void>`、`Deadline` |
 | [`validateJsonValue`](#validatejsonvalue) | `void` |
 | [`rejectUnknownKeys`](#rejectunknownkeys) | `void` |
+| [`checkLaunchArguments`](#checklauncharguments) | `ResolvedLaunchArguments \| undefined` |
+| [`appleUserDefaults`](#appleuserdefaults) | `readonly string[]` |
 | [`rejectUnknownOptions`](#rejectunknownoptions) | `void` |
 | [`obj`](#obj) | `WithoutUndefined<T>` |
 | [`raceAbort`、`withTimeout`、`withinCleanupBudget`](#timing-helpers) | `Promise<T>`、`Promise<T>`、`Promise<void>` |
@@ -1676,6 +1772,32 @@ rejectUnknownKeys('web()', options, ['browser', 'viewport']);
 
 - 如果某个已知键看起来可能是拼写错误的正确形式，消息会指出最接近的已知键，否则列出所有已知键。
 - 对于测试传给测试夹具方法的对象，将 `code` 设为 `'INVALID_ARGUMENT'`。
+
+#### `checkLaunchArguments`
+
+```ts
+export function checkLaunchArguments(
+  label: string,
+  declared: unknown,
+  code?: 'INVALID_CONFIG' | 'INVALID_ARGUMENT', // default: 'INVALID_CONFIG'
+): ResolvedLaunchArguments | undefined;
+```
+
+```ts
+const launchArguments = checkLaunchArguments('device.openApp({ launchArguments })', options.launchArguments, 'INVALID_ARGUMENT');
+// device.openApp({ launchArguments }).env must be a string, number, boolean, or array of strings, got null
+```
+
+#### `appleUserDefaults`
+
+```ts
+export function appleUserDefaults(launchArguments: ResolvedLaunchArguments): readonly string[];
+```
+
+```ts
+appleUserDefaults({ AppleLanguages: ['fr', 'en-GB'], e2e: true, offset: -1, mode: '(draft)' });
+// ['-AppleLanguages', '(fr, en-GB)', '-e2e', 'YES', '-offset', '"-1"', '-mode', '"(draft)"']
+```
 
 #### `rejectUnknownOptions`
 
@@ -1967,7 +2089,7 @@ export function stopProviderRecording(
 
 ### 引擎提供的测试夹具
 
-引擎通过 `fixtures` 为测试夹具提供具名接口。每个键都会成为一个测试夹具名称和能力名称。
+引擎通过 `fixtures` 为测试夹具提供具名接口。每个键都会成为一个测试夹具名称和能力名称。对测试来说，它与 `app` 和 `screen` 一样是[内置测试夹具](/reference/test#fixtures)。
 
 ```ts title="src/index.ts"
 fixtures: {
@@ -1989,7 +2111,7 @@ import { test as base } from 'e2e';
 
 const test = base.extend<{ printer: { print(text: string): Promise<void> } }>();
 
-test('prints a receipt', { requires: ['printer'] }, async ({ printer }) => {
+test('prints a receipt', { platforms: ['kiosk'] }, async ({ printer }) => {
   await printer.print('Order 42');
 });
 ```
@@ -2075,6 +2197,38 @@ export interface EngineFixtureContext {
 }
 ```
 
+#### 测试夹具隔离
+
+`isolation` 声明一次尝试所做的更改是否会保留到下一次尝试。它决定由该引擎支撑的内置测试夹具的作用域：引擎提供的测试夹具、`app` 和 `screen`。
+
+```ts
+defineEngine({ name: 'device', /* ... */ isolation: 'worker' });
+```
+
+| 值 | 含义 | 测试夹具作用域 |
+| --- | --- | --- |
+| `'attempt'`（默认） | `startAttempt` 为每次尝试提供全新的界面，例如浏览器上下文。 | 测试作用域的测试夹具。`beforeAll` 和 `afterAll` 无法读取它们。 |
+| `'worker'` | 一次尝试所做的更改会保留。设备会保留权限和已安装的应用。 | [工作进程测试夹具](/reference/test#worker-fixtures)。`beforeAll`、`afterAll` 和工作进程测试夹具可以得到它们。 |
+
+`@e2e-dev/mobile` 声明 `'worker'`。在这样的引擎上：
+
+- 每一轮测试套件钩子都在它自己的一次简短尝试中运行（先 `startAttempt`，再 `endAttempt`）。工作进程结束时，工作进程测试夹具的清理也是如此。让 `startAttempt` 不启动任何内容。
+- 在串行分组中，或在 `e2e mcp` 会话运行的测试中，钩子在已经打开的尝试上运行。引擎同一时间只运行一次尝试。
+- 当这次尝试无法打开，或运行被中断时，钩子会在没有这些内置测试夹具的情况下运行。参阅 [`beforeAll`](/reference/test#beforeall)。
+
+```ts
+/**
+ * What one attempt on an engine leaves for the next. `attempt`: nothing,
+ * `startAttempt` gives each attempt a fresh surface (a browser context), so
+ * the engine's fixtures, `app`, and `screen` are test fixtures, and a suite
+ * hook cannot use them. `worker`: what an attempt does stays (a device keeps
+ * permissions, keychain, and installed apps), so they are worker fixtures,
+ * which `beforeAll`, `afterAll`, and worker-scoped `test.extend()` fixtures
+ * see; a suite hook runs in a short attempt of its own for them.
+ */
+export type EngineIsolation = 'attempt' | 'worker';
+```
+
 #### 声明操作
 
 `context.fixture(name, surface, operations)` 声明哪些方法会作为步骤记录。每个操作接受：
@@ -2126,7 +2280,7 @@ return context.fixture('printer', printer, { print: { kind: 'resource' } });
 
 ### 导出的名称
 
-`EngineCleanupContext`、`EngineDisposeContext`、`OperationContext`、`TextPattern`、`SemanticQuery`、`LocatorExpression`、`NodeRef`、`SemanticNode`、`ViewportPoint`、`ViewportSize`、`ObservationPixels`、`LocatorAction`、`LocatorActionKind`、`PointerAction`、`PointerActionKind`、`ScrollDirection`、`Momentum`、`SelectOption`、`Key`、`KeyModifier`、`KeyName`、`ParsedKey`、`ENGINE_SPI_VERSION`、`LOCATOR_ACTION_KINDS`、`POINTER_ACTION_KINDS`、`KEY_MODIFIERS`、`KEY_NAMES`、`parseKey`、`ENGINE_ERROR_CODES`、`RETRYABLE_ENGINE_ERROR_CODES`、`Secret`、`isSecret`、`TextMatch`、`JsonValue`、`JsonValueRules`、`ResolveExpressionOptions`、`PollConditionOptions`、`WithoutUndefined`、`FixtureOperation`、`OBSERVED_NAME_LIMIT` 和 `OBSERVED_TEXT_LIMIT` 均从 `e2e/engine` 导出。[引擎协议](/reference/engine-protocol)的 `connectEngine`、`serveEngine`、`describeEngine`、`spawnTransport`、`socketTransport`、`loopbackTransport`、`ENGINE_METHODS`、`ENGINE_PROTOCOL_VERSION` 及其类型也从这里导出。
+`EngineCleanupContext`、`EngineDisposeContext`、`OperationContext`、`TextPattern`、`SemanticQuery`、`LocatorExpression`、`NodeRef`、`SemanticNode`、`ViewportPoint`、`ViewportSize`、`ObservationPixels`、`LocatorAction`、`LocatorActionKind`、`PointerAction`、`PointerActionKind`、`ScrollDirection`、`Momentum`、`SelectOption`、`Key`、`KeyModifier`、`KeyName`、`ParsedKey`、`ENGINE_SPI_VERSION`、`LOCATOR_ACTION_KINDS`、`KNOWN_LOCATOR_ACTION_KINDS`、`POINTER_ACTION_KINDS`、`KEY_MODIFIERS`、`KEY_NAMES`、`parseKey`、`ENGINE_ERROR_CODES`、`RETRYABLE_ENGINE_ERROR_CODES`、`Secret`、`isSecret`、`TextMatch`、`JsonValue`、`JsonValueRules`、`ResolveExpressionOptions`、`PollConditionOptions`、`WithoutUndefined`、`FixtureOperation`、`EngineIsolation`、`OBSERVED_NAME_LIMIT` 和 `OBSERVED_TEXT_LIMIT` 均从 `e2e/engine` 导出。[引擎协议](/reference/engine-protocol)的 `connectEngine`、`serveEngine`、`describeEngine`、`spawnTransport`、`socketTransport`、`loopbackTransport`、`ENGINE_METHODS`、`ENGINE_PROTOCOL_VERSION` 及其类型也从这里导出。
 
 ### `SemanticNode`
 
@@ -2163,11 +2317,32 @@ export interface SemanticNode {
   /**
    * Boolean states the platform reports. `pressed` is a toggle button's
    * pressed state; `secure` marks a field whose value is never observed.
+   * `readonly` is present only on a node that has a read-only state, as
+   * Playwright's `getReadonly` decides on the web (an input, textarea, or
+   * select by its `readonly` attribute, an element whose ARIA role takes
+   * `aria-readonly` by that attribute, any other editing host `false`), and
+   * only where the platform knows, as Android does: absent means the node has
+   * no read-only state to read, not `false`. `empty` is whether the node
+   * holds nothing, as Playwright's `toBeEmpty` reads it on the web (an input or
+   * textarea by its raw value, any other element by its trimmed text content),
+   * and on a device a text field by its value, any other node by the text
+   * and values in its subtree. An engine reports it on the nodes `locate`
+   * returns, never in an observation, and never on a secure field: absent
+   * means the engine does not say.
    */
   readonly states?: Readonly<
     Partial<
       Record<
-        'checked' | 'disabled' | 'selected' | 'expanded' | 'pressed' | 'focused' | 'hidden' | 'secure',
+        | 'checked'
+        | 'disabled'
+        | 'selected'
+        | 'expanded'
+        | 'pressed'
+        | 'focused'
+        | 'hidden'
+        | 'secure'
+        | 'readonly'
+        | 'empty',
         boolean
       >
     >

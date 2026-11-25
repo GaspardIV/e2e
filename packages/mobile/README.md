@@ -104,7 +104,6 @@ spread.
   every secure field are painted black before the file is kept, and a
   screenshot that cannot be redacted is not written. No `state` capability: a
   simulator has no portable session snapshot.
-- **App kind**: a target with `app.bundleId` or `app.appPath` is a `native-app` target, so a portable suite can `requires: ['native-app']`.
 
 ## Replay cache
 
@@ -139,9 +138,10 @@ test('shows the version in dark mode', async ({ agent, device, screen }) => {
 
 Methods: `setNetwork`, `setAirplaneMode`, `setPermission`, `setLocation`,
 `clearLocation`, `setAppearance`, `setOrientation`, `fold`, `setBiometrics`,
-`enrollBiometrics`, `installApp`, `openApp`, `openLink`, `closeApp`,
-`clearKeychain`, `foregroundApp`, `home`, `back`, `alert`, `dismissKeyboard`,
-`clipboard`, `setClipboard`, and the `locator` accessor.
+`enrollBiometrics`, `installApp`, `uninstallApp`, `isAppInstalled`,
+`openApp`, `openLink`, `closeApp`, `clearKeychain`, `foregroundApp`, `home`,
+`back`, `shake`, `alert`, `dismissKeyboard`, `isKeyboardShown`, `clipboard`,
+`setClipboard`, and the `locator` accessor.
 
 `device.unstable_raw` is the raw driver session, for what the methods do not
 cover. Its `client` calls are not steps: the report and trace leave them out,

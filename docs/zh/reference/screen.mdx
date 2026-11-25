@@ -429,8 +429,9 @@ await screen.getByTestId('feed').scrollUntilVisible(row);
 | --- | --- |
 | [`screen.tree`](#screen-tree) | `Promise<string>` |
 | [`screen.debug`](#screen-debug) | `Promise<void>` |
+| [`screen.pause`](#screen-pause) | `Promise<void>` |
 
-两者都只读取一次整个屏幕，不等待，并且适用于所有引擎。它们作为步骤运行。定位器不提供这两个方法，在框架上调用会抛出 `INVALID_ARGUMENT`。
+`tree` 和 `debug` 都只读取一次整个屏幕，不等待，并且适用于所有引擎。它们作为步骤运行。定位器不提供这两个方法，在框架上调用会抛出 `INVALID_ARGUMENT`。
 
 #### `screen.tree`
 
@@ -472,6 +473,43 @@ debug(options?: ActionOptions): Promise<void>;
 await screen.debug();
 ```
 
+#### `screen.pause`
+
+测试会在这一行暂停，同时保持应用打开，直到被恢复。按键和命令见[暂停测试](/debugging#pause-a-test)。
+
+```ts
+/**
+ * Pauses the test at this line, with the app open, until it is resumed with
+ * Enter in the terminal or with `e2e run --step next` from another shell in
+ * the same directory. In `e2e run`, the test is paused each time the line
+ * runs. Paused time doesn't count toward the test's timeout. Call it with
+ * `await` on `screen`, between steps in fixture setup, a `beforeEach` hook,
+ * or the test body. Anywhere else, or with `CI` set, the test isn't paused
+ * and the call fails.
+ */
+pause(): Promise<void>;
+```
+
+```ts
+await screen.pause();
+```
+
+- 每次尝试都会暂停测试，包括重试和准备测试。
+- 在 `--step` 运行中，按 `n`、`a` 或运行 `e2e run --step rest` 之后，测试仍会在 `screen.pause()` 处暂停。
+- 暂停时间不计入任何超时。
+- 在 [MCP](/mcp-server) `open_session {test}` 打开的会话中、基于 `@e2e-dev/core` 或 `openHost` 的程序中，以及 `e2e/runner` 的 `run()` 中，测试不会暂停。设置了 `CI` 时，测试在 `run()` 中仍会以 `PAUSE_UNAVAILABLE` 失败，与 `e2e run` 相同。
+- 在 `e2e run --watch` 中，暂停时按 `q` 或运行 `e2e run --step stop`，只会取消当前运行。
+- 定位器不提供该方法。
+
+| 抛出的错误 | 触发条件 |
+| --- | --- |
+| `PAUSE_UNAVAILABLE` | 设置了 `CI`。请在提交前删除该调用，或在终端中使用 `e2e run` 运行测试。在不允许暂停的位置调用时，会改为以下表中对应的错误失败。 |
+| `INVALID_ARGUMENT` | 在定位器或框架上、在 [`afterEach`](/reference/test#aftereach) 钩子中、在测试夹具清理中，或在测试体返回后运行的未 await 代码中调用。请在 `screen` 上，于测试夹具准备阶段、`beforeEach` 钩子或测试体中的步骤之间调用。 |
+| `ACTION_FAILED` | 在智能体步骤内调用，例如在 [`onAction`](/reference/agent#agent-act) 钩子或[自定义执行器](/executors)中。步骤会以暂停的消息失败，测试不会暂停。在内置智能体的[项目工具](/tools)中，拒绝会作为失败的工具结果返回给模型，步骤继续执行。请改为在步骤之间调用。 |
+| `ASSERTION_FAILED` | 在 [`expect.poll`](/reference/expect#polling-a-value) 读取内调用。读取会重试，直到轮询超时。请在读取之外调用。 |
+| `STEP_NOT_AWAITED` | 测试体返回时，它未 await 的 `screen.pause()` 仍在等待。测试会在暂停所在行失败。请在调用前加上 `await`。 |
+| `RUNNER_BUSY` | 运行没有终端，而该目录中的另一个运行已受 `e2e run --step` 控制。请用 `e2e run --step stop` 结束那个运行，或在终端中运行这个测试。另一个运行结束后，测试会在本次运行的下一个 `screen.pause()` 处暂停。 |
+
 ### 定位器操作
 
 | 方法 | 返回值 |
@@ -490,6 +528,7 @@ await screen.debug();
 | [`uncheck`](#uncheck) | `Promise<void>` |
 | [`selectOption`](#selectoption) | `Promise<void>` |
 | [`focus`](#focus) | `Promise<void>` |
+| [`blur`](#blur) | `Promise<void>` |
 | [`hover`](#hover) | `Promise<void>` |
 | [`setInputFiles`](#setinputfiles) | `Promise<void>` |
 | [`dragTo`](#dragto) | `Promise<void>` |
@@ -509,7 +548,7 @@ await screen.debug();
 #### `tap`
 
 ```ts
-/** Taps exactly one matching actionable node; with `position`, taps that point of its box once it is in view, with no other actionability check. */
+/** Taps exactly one matching actionable node, `count` times in a row; with `position`, taps that point of its box once it is in view, with no other actionability check. */
 tap(options?: TapOptions): Promise<void>;
 /** Alias of tap. */
 click(options?: TapOptions): Promise<void>;
@@ -519,17 +558,20 @@ click(options?: TapOptions): Promise<void>;
 await screen.getByRole('button', 'Save').tap({ timeout: 10_000 });
 await screen.getByRole('image', 'Seat map').tap({ position: { x: 120, y: 48 } });
 await row.click({ modifiers: ['Shift'] });
+await screen.getByText('Shipping address').tap({ count: 3 });
 ```
 
 选项为 [`TapOptions`](#types)：
 
+- `count`：连续点击的次数，取值为正的安全整数（safe integer），默认为 1。在浏览器中，这些点击作为一次多击送达，因此三击会选中一个段落。在设备上，它们是以 `doubleTap` 的节奏按下的 `count` 次。`count: 2` 与 [`doubleTap()`](#doubletap) 是同一个操作。3 次及以上需要引擎列出 `multiTap` 操作；浏览器引擎和移动端引擎都支持。
 - `modifiers`：浏览器引擎会按住这些修饰键。
 - `position`：相对于节点左上角、位于边框内部的偏移量，以 CSS 像素为单位。如果引擎列出了 `scrollIntoView`，它会将节点滚动到视图中。然后读取节点的边界框，在指定点分派指针事件。该手势不关联节点，因此不会执行平台的其他可操作性检查（已启用、未被遮挡）。
 
 | 抛出的错误 | 触发条件 |
 | --- | --- |
-| `INVALID_ARGUMENT` | 未知或重复的修饰键，或同时使用 `modifiers` 和 `position`。 |
+| `INVALID_ARGUMENT` | 未知或重复的修饰键、同时使用 `modifiers` 和 `position`、`count` 不是正的安全整数，或在使用 `position` 的同时指定大于 1 的 `count`。 |
 | `UNSUPPORTED_CAPABILITY` | 在未声明 `tapModifiers` 的引擎上使用 `modifiers`，包括移动端引擎；在执行操作前抛出。 |
+| `UNSUPPORTED_CAPABILITY` | 在没有 `multiTap` 操作的引擎上使用 3 或更大的 `count`，或 `count` 超过引擎的上限（移动端引擎为 200）；在执行操作前抛出。 |
 | `UNSUPPORTED_CAPABILITY` | 在不支持 `tap` 指针操作的引擎上使用 `position`。 |
 | `ACTION_FAILED` | 对浏览器引擎无法滚动到视图中的节点使用 `position`；其滚动会等待节点可见。其他引擎按各自报告的情况失败。 |
 | `LOCATOR_NOT_FOUND` | 对已解析但在超时内始终没有可见边界框的节点使用 `position`。 |
@@ -711,6 +753,19 @@ focus(options?: ActionOptions): Promise<void>;
 await screen.getByLabel('Email').focus();
 ```
 
+#### `blur`
+
+```ts
+/** Removes focus from exactly one node if it is focused. */
+blur(options?: ActionOptions): Promise<void>;
+```
+
+仅支持 Web。如果匹配的节点未获得焦点，此操作不会产生效果。
+
+```ts
+await screen.getByLabel('Email').blur();
+```
+
 #### `hover`
 
 ```ts
@@ -725,12 +780,15 @@ await screen.getByRole('button', 'Account').hover();
 #### `setInputFiles`
 
 ```ts
-/** Sets the files of exactly one file input, or of a control that opens a file chooser; paths resolve from the project root, and an empty array clears the input. */
-setInputFiles(paths: string | readonly string[], options?: ActionOptions): Promise<void>;
+/** Sets the files of exactly one file input, or of a control that opens a file chooser; paths resolve from the project root, payloads supply bytes in memory, and an empty array clears the input. */
+setInputFiles(files: string | readonly string[] | FilePayload | readonly FilePayload[], options?: ActionOptions): Promise<void>;
 ```
 
 ```ts
 await screen.getByLabel('Receipt').setInputFiles('fixtures/receipt.pdf');
+await screen.getByLabel('Receipt').setInputFiles({
+  name: 'receipt.txt', mimeType: 'text/plain', buffer: Buffer.from('Receipt total: 12.00'),
+});
 await screen.getByLabel('Receipt').setInputFiles([]);
 ```
 
@@ -1212,6 +1270,14 @@ export interface TapOptions extends ClickOptions {
    * a box, which needs the engine's `tap` pointer action.
    */
   position?: Point;
+  /**
+   * How many taps in a row, a positive safe integer, default 1. `2` is the
+   * same as `doubleTap()`; 3 or more needs an engine that declares the
+   * `multiTap` action, `UNSUPPORTED_CAPABILITY` otherwise. A count above the
+   * engine's own limit (200 on the mobile engine) is also
+   * `UNSUPPORTED_CAPABILITY`. A count above 1 is not combined with `position`.
+   */
+  count?: number;
 }
 
 /** One option of a select: its label (a bare string too), its `value` attribute, or its zero-based index. */

@@ -201,7 +201,7 @@ workers: 4, // default: 1 in CI, else half the cores
 
 #### `reporters`
 
-输出渲染器和报告器对象。
+本次运行的报告器：内置 ID，以及报告器对象，例如 `e2e/reporters` 中的工厂函数。
 
 ```ts
 reporters: ['list', 'junit'], // default: ['list']
@@ -209,13 +209,14 @@ reporters: ['list', 'junit'], // default: ['list']
 
 | 值 | 作用 |
 | --- | --- |
-| `'list'` | 终端进度、失败信息和运行摘要。 |
-| `'junit'` | 写入 `<output>/junit.xml`。 |
-| `'markdown'` | 写入 `<output>/summary.md`。 |
-| `'json'` | 输出报告。不能与 `list` 同用：两者同时使用会导致 `INVALID_CONFIG`。 |
-| `Reporter` 对象 | 与内置报告器一起运行。`--reporter` 不会移除它。 |
+| `'list'`、`list()` | 终端进度、失败信息和运行摘要。 |
+| `'dot'`、`dot()` | 简洁的终端进度、失败信息和运行摘要。不能与 `list` 同用：两者同时使用会导致 `INVALID_CONFIG`。 |
+| `'junit'`、`junit()` | 写入 `<output>/junit.xml`，或 `outputFile`。 |
+| `'markdown'`、`markdown()` | 写入 `<output>/summary.md`，或 `outputFile`。 |
+| `'json'`、`json()` | 将报告输出到 stdout。与它同时使用时，`list` 或 `dot` 输出到 stderr，除非为它们指定了 `stream`。 |
+| 其他 `Reporter` 对象 | 与内置报告器一起运行。`--reporter` 不会移除它。 |
 
-未知 ID 会导致 `INVALID_CONFIG`。参阅[报告器](/reference/reporters)。
+ID 等同于不带选项调用其工厂函数。未知 ID 会导致 `INVALID_CONFIG`。参阅[报告器](/reference/reporters)。
 
 ### targets
 
@@ -238,7 +239,7 @@ targets: [
 | [`video`](#video) | `RecordingMode` | 配置中的 `video` |
 
 - `{ engine: web(), app: { url } }` 就是一个完整的测试目标。
-- 如果测试的 `requires` 指定了测试目标缺少的能力，该测试会在此测试目标上跳过。被选中测试所依赖的 `test.setup` 必须能够在该测试目标上运行，否则选择过程会以 `COLLECTION_ERROR` 失败。
+- 如果测试的 `platforms` 不包含测试目标的平台，该测试会在此测试目标上跳过。被选中测试所依赖的 `test.setup` 必须能够在该测试目标上运行，否则选择过程会以 `COLLECTION_ERROR` 失败。
 
 完整声明见 [`Target`](#target)。
 
@@ -310,8 +311,8 @@ targets: [
 | [`linkBase`](#linkbase) | `string` | - |
 | [`identity`](#identity) | `string` | 根据应用推导 |
 | [`environment`](#environment) | `'test' \| 'staging' \| 'production'` | `'test'` 或 `'production'` |
-| [`launchArguments`](#launcharguments) | `string[]` | - |
-| [`permissions`](#permissions) | `Record<string, AppPermissionState>` | - |
+| [`launchArguments`](#launcharguments) | `string[] \| Record<string, LaunchArgumentValue>` | - |
+| [`permissions`](#permissions) | `Record<string, AppPermissionState> \| 'all'` | - |
 | [`command`](#command) | `CommandConfig` | - |
 | [`readyUrl`](#readyurl) | `string` | `url` |
 
@@ -416,6 +417,15 @@ environment: 'staging', // default: 'test' for a local host or no URL, else 'pro
 launchArguments: ['-e2e', 'YES'],
 ```
 
+```ts
+launchArguments: { AppleLanguages: ['fr'], AppleLocale: 'fr_FR', e2e: true },
+```
+
+```ts
+type LaunchArgumentValue = string | number | boolean | readonly string[];
+type LaunchArguments = readonly string[] | Readonly<Record<string, LaunchArgumentValue | undefined>>;
+```
+
 选择构建模式的参数会改变应用本身：为每种模式设置独立的 `identity`。
 
 #### `permissions`
@@ -426,10 +436,10 @@ launchArguments: ['-e2e', 'YES'],
 permissions: { camera: 'grant' },
 ```
 
-每项为 `'grant'`、`'deny'` 或 `'reset'`。
+每项为 `'grant'`、`'deny'` 或 `'reset'`。`permissions: 'all'` 授予测试目标的引擎能授予的所有权限。
 
 - `mobile()` 测试目标会在每次全新启动前设置各项权限。参阅[权限](/reference/mobile#engine)。
-- `web()` 测试目标只接受 `'grant'`，并向本次尝试中任意源上的所有页面授予该权限。无头模式的 Chromium 会拒绝未列出的权限。参阅[授予浏览器权限](/web#granting-browser-permissions)。
+- `web()` 测试目标只接受 `'grant'`，并向本次尝试中任意源上的所有页面授予该权限。无头模式的 Chromium 会拒绝未列出的权限。参阅[授予浏览器权限](/web#granting-browser-permissions)。`'all'` 授予下表中该浏览器的所有名称。
 
 | 浏览器 | 名称 |
 | --- | --- |
@@ -1185,7 +1195,7 @@ cache: { strict: true }, // default: false
 | `retries` | `0` | `1` |
 | `workers` | `max(1, floor(availableParallelism() / 2))` | `1` |
 | `cache` | `read-write` | 未设置时为 `read-only` |
-| `test.only` | 允许 | `ONLY_IN_CI`，退出码 2 |
+| `test.only`、`describe.only` | 允许 | `ONLY_IN_CI`，退出码 2 |
 | `command.reuseExisting` | 生效 | 忽略，并提示 |
 
 ## 加载

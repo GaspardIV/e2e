@@ -20,6 +20,7 @@ import type {
   PointerActionKind,
   ScrollDirection,
   SemanticNode,
+  ViewportIntersection,
   ViewportPoint,
   ViewportSize,
 } from './contract.ts';
@@ -74,6 +75,9 @@ export type GrammarVerb =
   | 'pressKey'
   | 'dismissKeyboard';
 
+/** Why pixels a caller asked for are not part of an observation. */
+export type PixelsWithheld = 'MASKING_UNPROVEN';
+
 export type Observation = ObservationMetadata & (
   | {
       readonly kind: 'semantic';
@@ -81,7 +85,14 @@ export type Observation = ObservationMetadata & (
       readonly truncated: boolean;
       /** The engine's measured keyboard state (`EngineSnapshot.keyboardVisible`); `false` when it measured none, absent only when it did not measure. */
       readonly keyboardVisible?: boolean;
+      /** The screenshot, only when its masked regions cover every secure node. */
       readonly pixels?: ObservationPixels;
+      /**
+       * Why pixels the engine answered with are not here: its masked regions
+       * (`maskedRegionCount`) are fewer than the secure nodes, or it withheld
+       * the pixels itself and sent the count alone.
+       */
+      readonly pixelsWithheld?: PixelsWithheld;
     }
   | {
       readonly kind: 'pixels';
@@ -101,8 +112,8 @@ interface ObservationMetadata {
   readonly capturedAt: string;
   readonly viewport: ViewportSize;
   /**
-   * What the engine masked against what it saw. Pixel completeness is judged
-   * downstream from these counts: fewer masked regions than secure nodes
+   * What the engine masked against what it saw. The session judges pixel
+   * completeness from these counts: fewer masked regions than secure nodes
    * withholds the pixels and keeps the tree.
    */
   readonly redaction: {
@@ -187,6 +198,8 @@ export interface TargetSession {
   readonly pointerActions: ReadonlySet<PointerActionKind>;
   /** Whether the engine declared `tapModifiers`, so the tap actions may carry `modifiers`. */
   readonly tapModifiers: boolean;
+  /** Whether the engine implements `viewportIntersection`, so `toBeInViewport` can refuse before it waits for a match. */
+  readonly measuresViewport: boolean;
   /** Captures one atomic agent observation; the harness redacts it downstream. */
   observe(operation: OperationContext, options?: EngineObserveOptions): Promise<Observation>;
   /** Resolves immediately; the runner owns query polling and strictness. */
@@ -195,6 +208,8 @@ export interface TargetSession {
   read(ref: NodeRef, operation: OperationContext): Promise<SemanticNode>;
   /** Reads requested rendered properties without changing app state. */
   readStyle(ref: NodeRef, properties: readonly ComputedStyleProperty[], operation: OperationContext): Promise<ComputedStyleValues>;
+  /** Measures how much of a located node is inside the viewport, checked against the contract's shape. */
+  viewportIntersection(ref: NodeRef, operation: OperationContext): Promise<ViewportIntersection>;
   /** Performs exactly one action on a located or observed node. */
   perform(ref: NodeRef, action: LocatorAction, operation: OperationContext): Promise<void>;
   /**

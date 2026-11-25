@@ -45,7 +45,9 @@ import type { BrowserLease, BrowserProvider, CdpTarget, WebConnectOptions, WebIn
 ({ name: 'hosted', acquire: async () => ({ id: 's', cdpEndpoint: 'ws://x' }), release: async () => undefined, sweep: async () => 2 }) satisfies BrowserProvider;
 
 // Gates on the way to a protected app, the page size, the attribute that carries a test id, and the user agent.
-({ headers: { 'x-vercel-protection-bypass': 'token' }, basicAuth: { username: 'preview', password: 'secret' }, viewport: { width: 390, height: 844 }, testIdAttribute: 'data-qa', userAgent: 'Mozilla/5.0 playwright' }) satisfies WebOptions;
+({ headers: { 'x-vercel-protection-bypass': 'token' }, basicAuth: { username: 'preview', password: 'secret' }, viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, testIdAttribute: 'data-qa', userAgent: 'Mozilla/5.0 playwright' }) satisfies WebOptions;
+// @ts-expect-error the device scale factor is a number.
+({ deviceScaleFactor: '2' }) satisfies WebOptions;
 // @ts-expect-error basic auth is a username and a password; one without the other is no credential.
 ({ basicAuth: { username: 'preview' } }) satisfies WebOptions;
 // A configured secret keeps the password out of the config file.
@@ -84,3 +86,6 @@ import type { BrowserLease, BrowserProvider, CdpTarget, WebConnectOptions, WebIn
 ({ endpoint: 'wss://browser.example', headers: { Authorization: 42 } }) satisfies CdpTarget;
 // @ts-expect-error a CDP target must name its endpoint.
 ({ cdpEndpoint: () => ({ headers: {} }) }) satisfies WebConnectOptions;
+({ chromiumSandbox: false }) satisfies WebOptions;
+// @ts-expect-error chromiumSandbox is a boolean.
+({ chromiumSandbox: 'yes' }) satisfies WebOptions;

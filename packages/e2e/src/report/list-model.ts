@@ -7,7 +7,7 @@
 import type { ResultStatus } from '@e2e-dev/core/lib/run/records';
 import type { RecordedModel } from '@e2e-dev/core/lib/cache/trace';
 import type { SerializedError } from '@e2e-dev/core/lib/internal/errors';
-import type { StepPrompt } from '../run/step-hold.ts';
+import type { RunEventOf } from '../run/events.ts';
 import type { StepActivity, StepEvent, StepKind, StepProgress } from '@e2e-dev/core/lib/run/steps';
 import type { AiUsage } from './format.ts';
 
@@ -23,6 +23,8 @@ export function isShownEvent(event: StepEvent): event is ShownEvent {
 export interface CurrentStep {
   readonly api: string;
   readonly label: string;
+  /** The session the step runs on when it is not the test's own. */
+  readonly actor: string | undefined;
   /** Only an agent step has model turns to wait on. */
   readonly kind: StepKind;
   /**
@@ -48,13 +50,19 @@ export interface CurrentStep {
 export type FinishedStep = Pick<
   Extract<StepProgress, { phase: 'end' }>,
   'api' | 'label' | 'status' | 'durationMs' | 'modelCalls'
->;
+> & {
+  /** The session the step ran on when it is not the test's own. */
+  readonly actor?: string | undefined;
+};
 
 /** A pair that has started and whose result is still to come. */
 export interface RunningTest {
   readonly group: FileGroup;
   /** The pair's serial group, when it belongs to one. */
   readonly serialId: string | undefined;
+  /** The pair's agent and repeat: each runs a serial group of its own. */
+  readonly agent: string | undefined;
+  readonly repeat: number | undefined;
   readonly title: string;
   readonly startedMs: number;
   /**
@@ -77,10 +85,10 @@ export interface RunningTest {
   readonly ran: FinishedStep[] | undefined;
 }
 
-/** A running test whose next step waits at the `e2e run --step` prompt. */
+/** A running test that waits for a person, with its `paused` event. */
 export interface PausedTest {
   readonly test: RunningTest;
-  readonly prompt: StepPrompt;
+  readonly event: RunEventOf<'paused'>;
 }
 
 /** The model and agent named in the run header. */

@@ -8,9 +8,10 @@
 
 import { createRequire } from 'node:module';
 import { createAgentDeviceClient } from 'agent-device';
-import { ConfigurationError, defineEngine, obj, type EngineAppCheckInfo, type EngineAppDeclaration, type EngineHandle } from '@e2e-dev/core/engine';
+import { ConfigurationError, defineEngine, obj, type EngineAppCheckInfo, type EngineAppDeclaration, type EngineHandle, type EngineIsolation } from '@e2e-dev/core/engine';
 import { createDeviceFixture } from './device.ts';
 import type { ClientFactory, MobileOptions, MobilePlatform } from './options.ts';
+import { assertLaunchArgumentsFor } from './launch-arguments.ts';
 import { isLink, linkTarget } from './links.ts';
 import { DEVICE_ACTIONS, DEVICE_POINTER_ACTIONS } from './actions.ts';
 import { AgentDeviceSurface, assertPermissions } from './surface.ts';
@@ -18,14 +19,27 @@ import type { MobileFixtures } from './fixtures.ts';
 
 const surfaces = new WeakMap<EngineHandle, AgentDeviceSurface>();
 
+/**
+ * The handle `mobile()` returns. Declared here so a config's inferred type
+ * names this package: a project sees `@e2e-dev/core` only through its
+ * dependencies, and TypeScript cannot write that path in a declaration.
+ */
+export interface MobileEngine<Platform extends string = string, Isolation extends EngineIsolation = EngineIsolation>
+  extends EngineHandle<MobileFixtures, Platform, Isolation> {}
+
 /** Assembles the manifest for one surface. Exported for tests that script the client. */
-export function buildEngine(surface: AgentDeviceSurface): EngineHandle<MobileFixtures> {
-  const handle = defineEngine<MobileFixtures>({
+export function buildEngine<Platform extends MobilePlatform>(surface: AgentDeviceSurface<Platform>): MobileEngine<Platform, 'worker'> {
+  const handle = defineEngine<MobileFixtures, Platform, 'worker'>({
     name: 'mobile',
     version: ownVersion(),
     spiVersion: 1,
     platform: surface.options.platform,
     ...(surface.pool.size === undefined ? {} : { workers: surface.pool.size }),
+    // `e2e run --device` names the device `prepare` binds; see DevicePool.prepare.
+    ...(surface.pool.selectsDevice ? { selectsDevice: true } : {}),
+    // `app.permissions: 'all'` is one agent-device `all` grant; see AgentDeviceSurface.presetPermissions.
+    grantsAllPermissions: true,
+    launchArgumentValues: true,
     prepare: (info) => surface.pool.prepare(info),
     finish: (info) => surface.pool.finish(info),
     doctor: (info) => surface.doctor(info),
@@ -37,6 +51,7 @@ export function buildEngine(surface: AgentDeviceSurface): EngineHandle<MobileFix
     // operation enforces its own; see InputBudget in support.ts.
     observe: (operation, options) => surface.observe(operation, options, surface.inputBudget('observe', operation)),
     locate: (expression, operation) => surface.locate(expression, operation, surface.inputBudget('locate', operation)),
+    viewportIntersection: (ref, operation) => surface.viewportIntersection(ref, operation, surface.inputBudget('viewport intersection', operation)),
     perform: (ref, action, operation) => surface.perform(ref, action, operation, surface.inputBudget(action.kind, operation)),
     actions: DEVICE_ACTIONS,
     performAt: (point, action, operation) => surface.performAt(point, action, operation, surface.inputBudget(action.kind, operation)),
@@ -66,13 +81,17 @@ export function buildEngine(surface: AgentDeviceSurface): EngineHandle<MobileFix
     fixtures: {
       device: (context) => createDeviceFixture(surface, context),
     },
+    // A device keeps permissions, keychain, and installed apps from one
+    // attempt to the next, so `device`, `app`, and `screen` are worker
+    // fixtures: `beforeAll` and `afterAll` can drive them.
+    isolation: 'worker',
   });
   surfaces.set(handle, surface);
   return handle;
 }
 
 /** Creates one agent-device engine: one device session per worker; a test launches the pinned app with `app.open()`. */
-export function mobile(options: MobileOptions): EngineHandle<MobileFixtures> {
+export function mobile<Platform extends MobilePlatform>(options: MobileOptions<Platform>): MobileEngine<Platform, 'worker'> {
   // The type requires it; `e2e mcp`'s `open_session {engine}` calls this with the JSON an agent wrote.
   const platform: unknown = (options as Partial<MobileOptions> | undefined)?.platform;
   if (platform !== 'ios' && platform !== 'android') {
@@ -126,6 +145,7 @@ function validateApp(app: EngineAppDeclaration, { targetName }: EngineAppCheckIn
       `${where} app.bundleId names an app by bundle id, package, or display name, not a link; a test opens a deep link or web link with device.openLink`,
     );
   }
+  assertLaunchArgumentsFor(platform, `${where} app.launchArguments`, app.launchArgumentValues ?? app.launchArguments);
   if (app.permissions !== undefined) assertPermissions(`${where} app.permissions`, app.permissions, 'INVALID_CONFIG');
 }
 

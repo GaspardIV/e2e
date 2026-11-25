@@ -81,6 +81,8 @@ export interface RecordedSessionCall {
 export type RecordedCall = RecordedPerform | RecordedPointerAction | RecordedKey | RecordedSessionCall;
 
 export interface FakeEngineBehavior {
+  /** The worker cap `prepare` reports to the run; without it the engine has no `prepare`. */
+  preparedWorkers?: number;
   /** Throw to fail worker boot. Called before any attempt. */
   onInit?(info: EngineInitInfo): void | Promise<void>;
   /** Throw or hang to fail attempt launches. */
@@ -110,11 +112,15 @@ export interface FakeEngineBehavior {
   observe?(operation: OperationContext, attemptIndex: number): void | Promise<void>;
   /** Overrides the observed tree; default is one Submit button. A scene replaces it. */
   tree?: SemanticNode;
-  /** Pixels an observation that asks for them returns, with the regions masked in them; none when it returns undefined. */
+  /**
+   * Pixels an observation that asks for them returns, with the regions masked
+   * in them; none when it returns undefined or neither field. A count without
+   * pixels is a screenshot the engine withheld.
+   */
   pixels?(
     options: EngineObserveOptions,
     attemptIndex: number,
-  ): { readonly pixels: ObservationPixels; readonly maskedRegionCount?: number } | undefined;
+  ): { readonly pixels?: ObservationPixels; readonly maskedRegionCount?: number } | undefined;
   /**
    * A scripted screen, built once per attempt with a stage for timed
    * mutations: `observe` reports it, `locate` resolves over it with the
@@ -160,6 +166,8 @@ export interface FakeEngineBehavior {
   onCapture?(): void | Promise<void>;
   /** Contributes a `gadget` fixture exercising every fixture-context facility. */
   fixtures?: boolean;
+  /** Declares that its state outlives an attempt, as a device's does: `gadget`, `app`, and `screen` become worker fixtures. */
+  isolation?: 'attempt' | 'worker';
   /** The secrets the engine declares, which `onStartAttempt` may resolve through its context. */
   secrets?: readonly Secret[];
 }
@@ -248,10 +256,12 @@ export function createFakeEngine(behavior: FakeEngineBehavior = {}): FakeEngineH
   const location = `${FAKE_APP_URL}/`;
   let videoStartedAt: string | undefined;
 
+  const { preparedWorkers } = behavior;
   const engine = defineEngine({
     name: 'fake',
     version: '1.0.0',
     spiVersion: ENGINE_SPI_VERSION,
+    ...(preparedWorkers === undefined ? {} : { prepare: async () => ({ workers: preparedWorkers }) }),
     async init(info) {
       events.push('init');
       inits.push(info);
@@ -301,7 +311,8 @@ export function createFakeEngine(behavior: FakeEngineBehavior = {}): FakeEngineH
         location: scene?.location ?? location,
         root: scene?.root() ?? tree,
         viewport: FAKE_VIEWPORT,
-        ...(captured === undefined ? {} : { pixels: captured.pixels, maskedRegionCount: captured.maskedRegionCount ?? 0 }),
+        ...(captured?.pixels === undefined ? {} : { pixels: captured.pixels }),
+        ...(captured?.maskedRegionCount === undefined ? {} : { maskedRegionCount: captured.maskedRegionCount }),
       };
     },
     actions: behavior.actions ?? LOCATOR_ACTION_KINDS.filter((kind) => kind !== 'swipe'),
@@ -359,6 +370,7 @@ export function createFakeEngine(behavior: FakeEngineBehavior = {}): FakeEngineH
       await behavior.perform?.(ref, action, operation, current);
     },
     ...(behavior.tapModifiers === undefined ? {} : { tapModifiers: behavior.tapModifiers }),
+    ...(behavior.isolation === undefined ? {} : { isolation: behavior.isolation }),
     ...(behavior.pointerActions === undefined
       ? {}
       : {
